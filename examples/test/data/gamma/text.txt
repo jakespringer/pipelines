@@ -1,0 +1,2 @@
+Small tests make reliable pipelines.
+Text files are easy to inspect.

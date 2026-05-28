@@ -1,0 +1,9 @@
+# Copy relevant values into ~/.config/pipelines/projects/test.toml.
+# This local-only profile keeps all outputs on host-local storage.
+
+[config]
+input_dir = "/absolute/path/to/pipelines/examples/test/data"
+remote_store = "file:///scratch/USER/pipelines-test/store"
+local_index_store = "file:///scratch/USER/pipelines-test/local-index-store"
+base_path = "/scratch/USER/pipelines-test/work"
+preview_prefix = "[local-test-preview]"

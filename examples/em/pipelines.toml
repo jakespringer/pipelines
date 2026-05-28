@@ -1,0 +1,12 @@
+# Versioned project defaults for the `em` example (pipelines v2).
+#
+# Project.init("em", from_file=__file__) discovers this file, then overlays
+# ~/.config/pipelines/projects/em.toml. Settings that name local paths,
+# buckets, or secrets belong in that system file; see project.local.toml.example.
+#
+[project]
+name = "em"
+
+[config]
+slurm_setup = "source ~/.bashrc && conda activate llm"
+slurm_defaults = { partition = "general" }

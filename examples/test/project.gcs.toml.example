@@ -1,0 +1,10 @@
+# Place these values in ~/.config/pipelines/projects/test.toml to exercise GCS.
+# The normal artifact lifecycle uploads to and retrieves from remote_store.
+# WordIndex deliberately remains local through its artifact-level store.
+
+[config]
+input_dir = "/absolute/path/to/pipelines/examples/test/data"
+remote_store = "gs://YOUR_BUCKET/pipelines-test/store"
+local_index_store = "file:///scratch/USER/pipelines-test/local-index-store"
+base_path = "/scratch/USER/pipelines-test/work"
+preview_prefix = "[gcs-test-preview]"
