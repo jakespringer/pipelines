@@ -60,9 +60,18 @@ class ParallelExecutor:
         plan = self._plan(targets, base_path)
         universe = {a.relpath: a for a in plan.ordered}
         satisfied = set() if force else {a.relpath for a in plan.satisfied}
-        specs = [
-            (a, [d.relpath for d in a.dependencies() if d.relpath in universe])
-            for a in plan.ordered if a.relpath not in satisfied
+
+        def deps_of(a):
+            return [d.relpath for d in a.dependencies() if d.relpath in universe]
+
+        specs = [(a, deps_of(a)) for a in plan.ordered if a.relpath not in satisfied]
+        # The full plan in topological order — every artifact, its type, its in-plan deps, and
+        # whether it was already committed. The run server records this so a monitor can show the
+        # experiment's structure (grouped by step) and what was skipped as already cached.
+        manifest = [
+            {"relpath": a.relpath, "cls": type(a).__name__, "deps": deps_of(a),
+             "cached": a.relpath in satisfied}
+            for a in plan.ordered
         ]
         pool = detect_pool(self.gpus, self.cpus, self.memory_mb)
 
@@ -81,7 +90,7 @@ class ParallelExecutor:
             specs=specs, done=satisfied, pool=pool,
             worker_argv_prefix=worker_argv_prefix,
             store=self.store, base_path=str(base_path),
-            project=getattr(Project, "name", None),
+            project=getattr(Project, "name", None), manifest=manifest,
         )
         return server.run()
 

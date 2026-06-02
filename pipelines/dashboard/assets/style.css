@@ -20,6 +20,7 @@
   --held: #7048e8;
   --blocked: #adb5bd;
   --completed: #1c7ed6;
+  --cached: #8a93a6;
   --failed: #e03131;
   --cancelled: #b08585;
 
@@ -46,6 +47,7 @@
     --held: #9775fa;
     --blocked: #5c5f66;
     --completed: #4dabf7;
+    --cached: #79818f;
     --failed: #ff6b6b;
     --cancelled: #c98a8a;
   }
@@ -78,7 +80,9 @@ a:hover { color: var(--accent); }
   gap: 14px;
   height: 52px;
   padding: 0 22px;
+  background: var(--surface);                                  /* fallback */
   background: color-mix(in srgb, var(--bg) 86%, transparent);
+  -webkit-backdrop-filter: saturate(1.2) blur(8px);
   backdrop-filter: saturate(1.2) blur(8px);
   border-bottom: 1px solid var(--border);
 }
@@ -176,43 +180,77 @@ main.wide { max-width: none; }
 .gauge .track { height: 5px; border-radius: 3px; background: var(--surface-2); margin-top: 8px; overflow: hidden; }
 .gauge .track > span { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
 
-.filters { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 14px; }
-.chip {
-  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
-  font-size: 12.5px; color: var(--muted); user-select: none;
-  border: 1px solid var(--border); border-radius: 999px; padding: 3px 11px;
-  background: var(--surface); transition: border-color .12s, color .12s, opacity .12s;
+/* ---- tabs ------------------------------------------------------------- */
+.tabs { display: flex; gap: 2px; margin: 0 0 22px; border-bottom: 1px solid var(--border); }
+.tab {
+  padding: 7px 13px 9px; font-size: 13.5px; color: var(--muted);
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
 }
-.chip:hover { border-color: var(--border-strong); }
-.chip.off { opacity: .45; }
-.chip b { color: var(--text); font-variant-numeric: tabular-nums; }
+.tab:hover { color: var(--text); }
+.tab.on { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
 
-/* ---- job table -------------------------------------------------------- */
-.jobs { background: var(--surface); border: 1px solid var(--border); border-radius: 11px; overflow: hidden; box-shadow: var(--shadow); }
-.job {
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr) auto auto 74px;
-  align-items: center; gap: 12px;
-  padding: 9px 15px;
-  border-left: 2px solid transparent;
-  border-bottom: 1px solid var(--border);
-  cursor: pointer; color: inherit;
+/* ---- overall progress (run detail) ------------------------------------ */
+.overall { margin: 2px 0 24px; }
+.overall-line { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 9px; }
+.overall-label { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.overall .bar { height: 8px; margin: 0; }
+
+/* ---- pipeline steps --------------------------------------------------- */
+.steps { display: flex; flex-direction: column; gap: 8px; }
+.step {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: var(--shadow); overflow: hidden; border-left: 2px solid transparent;
+}
+.step.active { border-left-color: var(--running); }
+.step-head {
+  display: flex; align-items: center; gap: 9px; padding: 10px 14px;
+  cursor: pointer; user-select: none; transition: background .1s ease;
+}
+.step-head:hover { background: var(--surface-2); }
+.caret { color: var(--faint); width: 10px; font-size: 10px; flex: none; }
+.step-name { font-weight: 600; letter-spacing: -.01em; white-space: nowrap; }
+.step-count { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+.step-from {
+  color: var(--faint); font-size: 12px; max-width: 28%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.spacer { flex: 1 1 auto; }
+
+.mini-tallies { display: inline-flex; gap: 11px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.mini-tallies .mt { display: inline-flex; align-items: center; gap: 5px; }
+.mini-tallies .mt.run { color: var(--running); font-weight: 600; }
+.mini-tallies .mt.run .dot { animation: pulse 2.2s ease-in-out infinite; }
+
+.bar.mini { width: 116px; height: 6px; margin: 0; flex: none; }
+
+/* ---- step instances --------------------------------------------------- */
+.insts { border-top: 1px solid var(--border); }
+.insts[hidden] { display: none; }
+.inst {
+  display: grid; grid-template-columns: 13px minmax(0, 1fr) auto auto 74px;
+  align-items: center; gap: 11px; padding: 7px 15px 7px 26px;
+  border-top: 1px solid var(--border); color: inherit; cursor: pointer;
   transition: background .1s ease;
 }
-.job:last-child { border-bottom: none; }
-.job:hover { background: var(--surface-2); color: inherit; }
-.job .name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.job .relpath { color: var(--faint); font-family: var(--mono); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 1px; }
-.job .state { font-size: 12px; color: var(--muted); text-transform: lowercase; }
-.job .gpus { font-size: 11.5px; color: var(--faint); font-family: var(--mono); }
-.job .when { font-size: 12.5px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
-.job .reason { color: var(--failed); font-size: 11.5px; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.insts > .inst:first-child { border-top: none; }
+.inst:hover { background: var(--surface-2); color: inherit; }
+.inst-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inst-state { font-size: 12px; color: var(--muted); text-transform: lowercase; }
+.inst-gpus { font-size: 11.5px; color: var(--faint); font-family: var(--mono); }
+.inst-when { font-size: 12.5px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.inst.cached { cursor: default; opacity: .6; }
+.inst.cached:hover { background: transparent; }
 
-.job.s-running { border-left-color: var(--running); }
-.job.s-yielding { border-left-color: var(--yielding); }
-.job.s-held { border-left-color: var(--held); }
-.job.s-completed { border-left-color: var(--completed); }
-.job.s-failed, .job.s-cancelled { border-left-color: var(--failed); }
+/* ---- all runs (expanded) ---------------------------------------------- */
+.run-list { display: flex; flex-direction: column; gap: 26px; }
+.run-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 2px 2px 13px; color: inherit; }
+.run-head:hover .run-title { color: var(--accent); }
+.run-title { font-weight: 600; font-size: 15px; letter-spacing: -.01em; }
+.run-port { color: var(--faint); font-family: var(--mono); font-size: 12px; }
+.run-sub { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.run-head .bar.mini { width: 140px; }
+
+.empty.small { padding: 20px; font-size: 13px; }
 
 /* ---- log view --------------------------------------------------------- */
 .log-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 2px 0 14px; }

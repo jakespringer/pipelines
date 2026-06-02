@@ -3,10 +3,15 @@
 //
 //   • a shared poll of /api/runs drives the header and the dashboard grid
 //   • run detail and log views stream live over Server-Sent Events
-//   • a hash router (#/ , #/run/<port> , #/run/<port>/log/<slug>) swaps views
+//   • a hash router (#/ , #/all , #/run/<port> , #/run/<port>/log/<slug>) swaps views
 //
-// Views are functions that mount into <main> and return { destroy } so the router can
-// tear down timers and event sources cleanly.
+// A run's jobs are organized the way `pipelines plan` shows them: grouped by pipeline step
+// (artifact type, ordered by depth). Each step summarizes its instances' states and expands to
+// the individual artifacts; already-committed artifacts are shown as "cached". The StepsView
+// component renders that structure and is shared by the run-detail page and the "all runs" tab.
+//
+// Views are functions that mount into <main> and return { destroy } so the router can tear down
+// timers and event sources cleanly.
 
 // --------------------------------------------------------------------------- //
 // DOM + formatting helpers
@@ -27,9 +32,10 @@ function h(tag, attrs, ...kids) {
   return node;
 }
 
-const STATES = ["running", "yielding", "queued", "held", "blocked", "completed", "failed", "cancelled"];
+const STATES = ["running", "yielding", "queued", "held", "blocked", "completed", "cached", "failed", "cancelled"];
 const RANK = Object.fromEntries(STATES.map((s, i) => [s, i]));
-const TERMINAL = new Set(["completed", "failed", "cancelled", "blocked"]);
+const TERMINAL = new Set(["completed", "cached", "failed", "cancelled", "blocked"]);
+const isActive = (s) => s === "running" || s === "yielding";
 
 const stateColor = (s) => `var(--${STATES.includes(s) ? s : "queued"})`;
 const dot = (s) => h("span", { class: "dot", style: `background:${stateColor(s)}` });
@@ -118,8 +124,8 @@ function statePill(state) {
   return h("span", { class: "pill" }, dot(state), state);
 }
 
-function segBar(counts, total) {
-  const bar = h("div", { class: "bar" });
+function segBar(counts, total, extra) {
+  const bar = h("div", { class: "bar" + (extra ? " " + extra : "") });
   if (!total) return bar;
   for (const s of STATES) {
     const n = counts[s] || 0;
@@ -128,11 +134,22 @@ function segBar(counts, total) {
   return bar;
 }
 
+// Full tallies (dot + count + word) — for roomy contexts.
 function tallies(counts) {
   const wrap = h("div", { class: "tallies" });
   for (const s of STATES) {
     const n = counts[s] || 0;
     if (n) wrap.append(h("span", { class: "tally" }, dot(s), h("b", {}, n), s));
+  }
+  return wrap;
+}
+
+// Compact tallies (dot + count, word on hover) — for tight headers.
+function miniTallies(counts) {
+  const wrap = h("span", { class: "mini-tallies" });
+  for (const s of STATES) {
+    const n = counts[s] || 0;
+    if (n) wrap.append(h("span", { class: "mt" + (isActive(s) ? " run" : ""), title: `${s}: ${n}` }, dot(s), n));
   }
   return wrap;
 }
@@ -154,14 +171,135 @@ function setCrumbs(items) {
   });
 }
 
+function tabs(active) {
+  const tab = (label, href, on) => h("a", { class: "tab" + (on ? " on" : ""), href }, label);
+  return h("div", { class: "tabs" },
+    tab("Runs", "#/", active === "runs"),
+    tab("All runs", "#/all", active === "all"));
+}
+
+function emptyState() {
+  return h("div", { class: "empty" },
+    h("div", { class: "big" }, "No runs yet"),
+    h("div", {}, "Start one with ", h("code", {}, "pipelines runparallel"), " and it will show up here."));
+}
+
 // --------------------------------------------------------------------------- //
-// Dashboard (#/)
+// StepsView — the pipeline structure: steps (artifact types) → instances.
+// Shared by the run-detail page (fed via SSE) and the "all runs" tab (polled).
+// Owns its own expand state, keyed so live updates never flicker.
+// --------------------------------------------------------------------------- //
+function StepsView(port) {
+  const el = h("div", { class: "steps" });
+  const expanded = new Map();   // type -> bool (explicit user choice)
+  const toggled = new Set();    // types the user has decided about (overrides the auto rule)
+  const stepEls = new Map();    // type -> { block, head, list, rows, step }
+  let steps = [];
+
+  // A step is open if the user said so, else automatically while it has active work.
+  const isOpen = (step) => toggled.has(step.type) ? !!expanded.get(step.type)
+    : step.instances.some((i) => isActive(i.state));
+
+  function toggle(step) {
+    const open = isOpen(step);
+    toggled.add(step.type);
+    expanded.set(step.type, !open);
+    render();
+  }
+
+  function setData(next) { steps = next || []; render(); }
+
+  function render() {
+    if (!steps.length) { el.replaceChildren(h("div", { class: "empty small" }, "No artifacts.")); stepEls.clear(); return; }
+    if (el.firstChild && el.firstChild.classList && el.firstChild.classList.contains("empty")) el.firstChild.remove();
+    const seen = new Set();
+    for (const step of steps) {
+      let se = stepEls.get(step.type);
+      if (!se) { se = makeStep(); stepEls.set(step.type, se); }
+      patchStep(se, step);
+      el.append(se.block);                       // keep declared (tier) order; moves existing nodes
+      seen.add(step.type);
+    }
+    for (const [t, se] of stepEls) if (!seen.has(t)) { se.block.remove(); stepEls.delete(t); }
+  }
+
+  function makeStep() {
+    const se = { step: null };
+    se.list = h("div", { class: "insts" });
+    se.rows = new Map();
+    se.head = h("div", { class: "step-head", onclick: () => se.step && toggle(se.step) });
+    se.block = h("div", { class: "step" }, se.head, se.list);
+    return se;
+  }
+
+  function patchStep(se, step) {
+    se.step = step;
+    const counts = countsOf(step);
+    const active = step.instances.some((i) => isActive(i.state));
+    const open = isOpen(step);
+    se.block.className = "step" + (active ? " active" : "");
+    se.head.replaceChildren(
+      h("span", { class: "caret" }, open ? "▾" : "▸"),
+      h("span", { class: "step-name" }, step.type),
+      h("span", { class: "step-count" }, "×" + step.total),
+      step.from_types && step.from_types.length
+        ? h("span", { class: "step-from", title: "depends on " + step.from_types.join(", ") }, "← " + step.from_types.join(", "))
+        : null,
+      h("span", { class: "spacer" }),
+      miniTallies(counts),
+      segBar(counts, step.total, "mini"));
+    if (!open) { se.list.replaceChildren(); se.rows.clear(); se.list.hidden = true; return; }
+    se.list.hidden = false;
+    const seen = new Set();
+    for (const inst of step.instances) {
+      let row = se.rows.get(inst.relpath);
+      if (!row) { row = makeInst(); se.rows.set(inst.relpath, row); }
+      patchInst(row, inst);
+      se.list.append(row);
+      seen.add(inst.relpath);
+    }
+    for (const [rp, row] of se.rows) if (!seen.has(rp)) { row.remove(); se.rows.delete(rp); }
+  }
+
+  function makeInst() {
+    return h("a", { class: "inst" },
+      dot("queued"),
+      h("span", { class: "inst-name" }),
+      h("span", { class: "inst-state" }),
+      h("span", { class: "inst-gpus" }),
+      h("span", { class: "inst-when" }));
+  }
+
+  function patchInst(row, inst) {
+    row.className = "inst s-" + inst.state + (inst.cached ? " cached" : "");
+    if (inst.cached) row.removeAttribute("href");
+    else row.href = `#/run/${port}/log/${encodeURIComponent(inst.slug || slugify(inst.relpath))}`;
+    row.children[0].style.background = stateColor(inst.state);
+    row.children[1].textContent = inst.name;
+    row.children[1].title = inst.relpath;
+    row.children[2].textContent = inst.cached ? "cached" : inst.state + (inst.held ? " · held" : "");
+    row.children[3].textContent = inst.cached ? "" : gpuText(inst);
+    row.children[4].textContent = inst.cached ? "" : elapsedText(inst);
+    row.title = inst.reason || inst.relpath;
+  }
+
+  return { el, setData, render };
+}
+
+function countsOf(step) {
+  const c = {};
+  for (const i of step.instances) c[i.state] = (c[i.state] || 0) + 1;
+  return c;
+}
+
+// --------------------------------------------------------------------------- //
+// Dashboard (#/) — cards
 // --------------------------------------------------------------------------- //
 function Dashboard(root) {
   setCrumbs([]);
   const sub = h("span", { class: "sub" });
   const cards = h("div", { class: "cards" });
-  root.append(h("div", { class: "page-head" }, h("h1", {}, "Runs"), sub), cards);
+  root.append(tabs("runs"), h("div", { class: "page-head" }, h("h1", {}, "Runs"), sub), cards);
 
   let sig = null;
   const unsub = Runs.subscribe((data) => {
@@ -170,7 +308,7 @@ function Dashboard(root) {
     const next = JSON.stringify(runs.map((r) => [r.port, r.status, Math.round(r.elapsed || 0), r.counts, poolShort(r.pool)]));
     if (next === sig) return;                       // nothing visible changed; skip the churn
     sig = next;
-    cards.replaceChildren(runs.length ? null : emptyState(), ...runs.map(runCard));
+    cards.replaceChildren(...(runs.length ? runs.map(runCard) : [emptyState()]));
   });
   return { destroy: unsub };
 }
@@ -182,7 +320,7 @@ function runCard(r) {
       h("span", { class: "card-port" }, `:${r.port}`),
       h("span", { style: "margin-left:auto" }, pill(r.status))),
     h("div", { class: "card-sub" }, cardSub(r)),
-    segBar(r.counts, r.n_jobs),
+    segBar(r.counts, r.n_artifacts),
     tallies(r.counts));
 }
 
@@ -195,10 +333,67 @@ function cardSub(r) {
   return bits.join("  ·  ");
 }
 
-function emptyState() {
-  return h("div", { class: "empty" },
-    h("div", { class: "big" }, "No runs yet"),
-    h("div", {}, "Start one with ", h("code", {}, "pipelines runparallel"), " and it will show up here."));
+// --------------------------------------------------------------------------- //
+// All runs (#/all) — every run expanded inline, polled
+// --------------------------------------------------------------------------- //
+function Overview(root) {
+  setCrumbs([]);
+  const sub = h("span", { class: "sub" });
+  const list = h("div", { class: "run-list" });
+  root.append(tabs("all"), h("div", { class: "page-head" }, h("h1", {}, "All runs"), sub), list);
+
+  const blocks = new Map();    // port -> { block, head, steps }
+  let timer = 0, dead = false;
+
+  async function tick() {
+    if (dead) return;
+    try {
+      render(await api("/api/overview"));
+      timer = setTimeout(tick, 2000);
+    } catch {
+      timer = setTimeout(tick, 3000);
+    }
+  }
+
+  function render(data) {
+    const runs = data.runs || [];
+    sub.textContent = runs.length ? `${runs.length} run${runs.length > 1 ? "s" : ""}` : "";
+    if (!runs.length) { list.replaceChildren(emptyState()); blocks.clear(); return; }
+    if (list.firstChild && list.firstChild.classList && list.firstChild.classList.contains("empty")) list.firstChild.remove();
+    const seen = new Set();
+    for (const r of runs) {
+      let b = blocks.get(r.port);
+      if (!b) { b = makeRunBlock(r.port); blocks.set(r.port, b); }
+      patchRunBlock(b, r);
+      list.append(b.block);
+      seen.add(r.port);
+    }
+    for (const [p, b] of blocks) if (!seen.has(p)) { b.block.remove(); blocks.delete(p); }
+  }
+
+  tick();
+  return { destroy() { dead = true; clearTimeout(timer); } };
+}
+
+function makeRunBlock(port) {
+  const head = h("a", { class: "run-head", href: `#/run/${port}` });
+  const steps = StepsView(port);
+  return { block: h("div", { class: "run-block" }, head, steps.el), head, steps };
+}
+
+function patchRunBlock(b, r) {
+  const c = r.counts || {};
+  const total = r.n_artifacts || 0;
+  const done = (c.completed || 0) + (c.cached || 0);
+  b.head.replaceChildren(
+    h("span", { class: "run-title" }, r.project || "run"),
+    h("span", { class: "run-port" }, `:${r.port}`),
+    pill(r.status),
+    h("span", { class: "run-sub" }, `${done}/${total} done · ${fmtDur(r.elapsed)}`),
+    h("span", { class: "spacer" }),
+    miniTallies(c),
+    segBar(c, total, "mini"));
+  b.steps.setData(r.steps || []);
 }
 
 // --------------------------------------------------------------------------- //
@@ -209,35 +404,38 @@ function RunDetail(root, port) {
   const head = h("div", { class: "page-head" });
   const meta = h("div", { class: "meta-row" });
   const gauges = h("div", { class: "gauges" });
-  const filters = h("div", { class: "filters" });
-  const jobs = h("div", { class: "jobs" });
-  root.append(head, meta, gauges, filters, jobs);
+  const overall = h("div", { class: "overall" });
+  const stepsView = StepsView(port);
+  root.append(head, meta, gauges, overall, stepsView.el);
 
-  const M = { jobs: new Map(), order: [], names: {}, pool: {}, status: "", live: false,
-              started_at: null, ended_at: null, project: null, store: null, logdir: null };
-  const hidden = new Set();
-  const rows = new Map();
+  const M = { status: "", live: false, started_at: null, ended_at: null, project: null,
+              store: null, logdir: null, n_cached: 0, pool: {}, steps: [], index: new Map() };
   let raf = 0, dead = false;
+
+  function reindex() {
+    M.index.clear();
+    for (const st of M.steps) for (const inst of st.instances) M.index.set(inst.relpath, inst);
+  }
 
   function applySnapshot(d) {
     Object.assign(M, {
       status: d.status, live: d.live, started_at: d.started_at, ended_at: d.ended_at,
-      project: d.project, store: d.store, logdir: d.logdir, pool: d.pool || {},
+      project: d.project, store: d.store, logdir: d.logdir, n_cached: d.n_cached || 0,
+      pool: d.pool || {}, steps: d.steps || [],
     });
-    M.jobs.clear(); M.order = []; M.names = {};
-    for (const j of d.jobs || []) { M.jobs.set(j.relpath, j); M.order.push(j.relpath); M.names[j.relpath] = j.name; }
+    reindex();
     setCrumbs([{ label: (d.project ? d.project + " " : "") + `:${port}` }]);
+    render();
   }
 
   function applyRecord(rec) {
     if (rec.type === "job_state" && rec.relpath) {
-      const rp = rec.relpath, prev = M.jobs.get(rp) || {};
-      const job = { ...prev, ...rec };
-      job.name = M.names[rp] || prev.name || rec.cls || rp.split("/")[0];
-      job.slug = prev.slug || slugify(rp);
-      M.names[rp] = job.name;
-      if (!M.jobs.has(rp)) M.order.push(rp);
-      M.jobs.set(rp, job);
+      const inst = M.index.get(rec.relpath);
+      if (inst) {
+        for (const k of ["state", "gpus", "pid", "exit_code", "reason", "held", "started_at", "ended_at"])
+          if (k in rec) inst[k] = rec[k];
+        inst.cached = false;
+      }
     } else if (rec.type === "pool") {
       M.pool = { gpus: rec.gpus, cpus: rec.cpus, memory_mb: rec.memory_mb };
     } else if (rec.type === "server_done") {
@@ -245,12 +443,7 @@ function RunDetail(root, port) {
       M.status = rec.ok ? "completed" : "failed";
       M.ended_at = M.ended_at || serverNow();
     }
-  }
-
-  function counts() {
-    const c = {};
-    for (const rp of M.order) { const st = (M.jobs.get(rp) || {}).state || "queued"; c[st] = (c[st] || 0) + 1; }
-    return c;
+    scheduleRender();
   }
 
   const scheduleRender = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; render(); }); };
@@ -263,67 +456,37 @@ function RunDetail(root, port) {
       pill(M.status),
       h("span", { class: "sub" }, `${M.live ? "running" : M.status} · ${fmtDur(elapsed)}`));
 
-    const m = [kv("jobs", M.order.length)];
+    const total = M.steps.reduce((n, s) => n + s.total, 0);
+    const m = [kv("artifacts", total)];
+    if (M.n_cached) m.push(kv("cached", M.n_cached));
     if (M.started_at) m.push(kv("started", fmtAgo(M.started_at)));
     if (M.store) m.push(kv("store", M.store, true));
     if (M.logdir) m.push(kv("logs", M.logdir, true));
     meta.replaceChildren(...m);
 
     gauges.replaceChildren(...gaugeEls(M.pool));
-    renderFilters();
-    renderJobs();
+
+    const counts = allCounts();
+    const done = (counts.completed || 0) + (counts.cached || 0);
+    overall.replaceChildren(
+      h("div", { class: "overall-line" },
+        h("span", { class: "overall-label" }, `${done} / ${total} done`),
+        tallies(counts)),
+      segBar(counts, total));
+
+    stepsView.setData(M.steps);
   }
 
-  function renderFilters() {
-    const c = counts();
-    filters.replaceChildren(...STATES.filter((s) => c[s]).map((s) =>
-      h("span", { class: "chip" + (hidden.has(s) ? " off" : ""),
-        onclick: () => { hidden.has(s) ? hidden.delete(s) : hidden.add(s); render(); } },
-        dot(s), s, h("b", {}, c[s]))));
-  }
-
-  function renderJobs() {
-    const list = M.order.map((rp) => M.jobs.get(rp)).filter(Boolean)
-      .filter((j) => !hidden.has(j.state))
-      .sort((a, b) => (RANK[a.state] ?? 9) - (RANK[b.state] ?? 9) || (a.name || "").localeCompare(b.name || ""));
-    if (!list.length) { jobs.replaceChildren(h("div", { class: "empty" }, hidden.size ? "No jobs match the filter." : "No jobs.")); rows.clear(); return; }
-    if (jobs.firstChild && jobs.firstChild.classList && jobs.firstChild.classList.contains("empty")) jobs.firstChild.remove();
-    const seen = new Set();
-    for (const j of list) {                          // keyed update: keep nodes, just reorder/patch
-      let row = rows.get(j.relpath);
-      if (!row) { row = makeRow(); rows.set(j.relpath, row); }
-      patchRow(row, j);
-      jobs.append(row);
-      seen.add(j.relpath);
-    }
-    for (const [rp, row] of rows) if (!seen.has(rp)) { row.remove(); rows.delete(rp); }
-  }
-
-  function makeRow() {
-    return h("a", { class: "job" },
-      dot("queued"),
-      h("div", { style: "min-width:0" }, h("div", { class: "name" }), h("div", { class: "relpath" })),
-      h("div", { class: "state" }),
-      h("div", { class: "gpus" }),
-      h("div", { class: "when" }));
-  }
-
-  function patchRow(row, j) {
-    row.href = `#/run/${port}/log/${encodeURIComponent(j.slug || slugify(j.relpath))}`;
-    row.className = `job s-${j.state}`;
-    row.children[0].style.background = stateColor(j.state);
-    row.children[1].children[0].textContent = j.name || j.relpath;
-    row.children[1].children[1].textContent = j.relpath;
-    row.children[2].textContent = j.state + (j.held ? " · held" : "");
-    row.children[3].textContent = gpuText(j);
-    row.children[4].textContent = elapsedText(j);
-    row.title = j.reason || "";
+  function allCounts() {
+    const c = {};
+    for (const st of M.steps) for (const i of st.instances) c[i.state] = (c[i.state] || 0) + 1;
+    return c;
   }
 
   const es = new EventSource(`/api/runs/${port}/stream`);
-  es.addEventListener("snapshot", (e) => { applySnapshot(JSON.parse(e.data)); render(); });
+  es.addEventListener("snapshot", (e) => applySnapshot(JSON.parse(e.data)));
   es.addEventListener("end", () => { es.close(); render(); });
-  es.onmessage = (e) => { applyRecord(JSON.parse(e.data)); scheduleRender(); };
+  es.onmessage = (e) => applyRecord(JSON.parse(e.data));
 
   const tick = setInterval(() => { if (M.live) scheduleRender(); }, 1000);  // keep elapsed live
 
@@ -417,15 +580,15 @@ function LogView(root, port, slug) {
     if (dead) return;
     try {
       const d = await api(`/api/runs/${port}`);
-      const j = (d.jobs || []).find((x) => x.slug === slug || slugify(x.relpath) === slug);
-      if (j) {
-        title.textContent = j.name || slug;
-        statusEl.replaceChildren(statePill(j.state));
-        metaEl.textContent = elapsedText(j);
-        setCrumbs([{ label: (d.project ? d.project + " " : "") + `:${port}`, href: `#/run/${port}` }, { label: j.name || slug }]);
+      const inst = findInstance(d, slug);
+      if (inst) {
+        title.textContent = inst.name || slug;
+        statusEl.replaceChildren(statePill(inst.state));
+        metaEl.textContent = elapsedText(inst);
+        setCrumbs([{ label: (d.project ? d.project + " " : "") + `:${port}`, href: `#/run/${port}` }, { label: inst.name || slug }]);
       }
       if (d.logdir) pathEl.textContent = `${d.logdir}/jobs/${slug}.log`;
-      const running = d.status === "live" && (!j || !TERMINAL.has(j.state));
+      const running = d.status === "live" && (!inst || !TERMINAL.has(inst.state));
       if (running) infoTimer = setTimeout(info, 2000);
     } catch {
       if (!dead) infoTimer = setTimeout(info, 4000);
@@ -434,6 +597,13 @@ function LogView(root, port, slug) {
   info();
 
   return { destroy() { dead = true; es.close(); clearTimeout(infoTimer); } };
+}
+
+function findInstance(detail, slug) {
+  for (const st of detail.steps || [])
+    for (const inst of st.instances)
+      if (inst.slug === slug || slugify(inst.relpath) === slug) return inst;
+  return null;
 }
 
 function checkbox(name, checked) {
@@ -456,6 +626,8 @@ function route() {
   if (parts[0] === "run" && parts[1]) {
     if (parts[2] === "log" && parts[3]) active = LogView(main, parts[1], decodeURIComponent(parts[3]));
     else active = RunDetail(main, parts[1]);
+  } else if (parts[0] === "all") {
+    active = Overview(main);
   } else {
     active = Dashboard(main);
   }

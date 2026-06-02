@@ -63,6 +63,7 @@ from a bare `relpath` against its selected Store (nothing is rebuilt).
 |---------|----------|
 | `run [SEL…] [--target G] [--force/--force-all] [--head/--tail N] [--executor X]` | Build the selection ([06](06-execution.md)). `--executor local` overrides to `LocalExecutor` for reproduction. |
 | `dryrun [SEL…]` | Plan + order + freshness + future planning; print plan, `relpath`s, resolved paths, auto-resolved/user-managed future fields, and (Slurm) `sbatch`/`afterok` wiring — without building. |
+| `dashboard [--port 7000] [--host H] [--open]` | Serve the web monitor for all runs (live + past); see [12-dashboard.md](12-dashboard.md). Project-independent. |
 | `status [SEL…]` | Per-artifact state (committed/running/queued/failed/blocked) + job ids (§4). |
 | `logs SEL` | Stream/tail an artifact's log (or its Slurm job log). |
 | `ls [SEL]` | List store contents by `relpath` with size, age. |

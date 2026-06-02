@@ -8,10 +8,11 @@ has exited.
 
 * :class:`RunView` replays one run's ``events.log`` into a queryable state, incrementally: each
   :meth:`RunView.refresh` reads only the bytes appended since the last call and returns the new
-  records, so a streaming endpoint can forward them verbatim.
+  records, so a streaming endpoint can forward them verbatim. It tracks *every* artifact in the
+  run's plan — the ones it built and the ones it skipped as already committed (``cached``).
 * :class:`RunIndex` discovers every run under the registry directory, keeps a cache of views, and
-  renders the JSON payloads the HTTP layer serves. Liveness is decided by the registry (a run owns
-  a ``<port>.json`` entry while serving) so we never probe a port that can't be alive.
+  renders the JSON payloads. The detail payload is grouped **by pipeline step** (artifact type,
+  ordered by depth) to mirror ``pipelines plan``.
 """
 
 from __future__ import annotations
@@ -24,11 +25,9 @@ from pathlib import Path
 from ..identity import slug as _slug
 from ..scheduler import registry
 
-# Display ordering for job states — running work first, terminal states last. Mirrors the
-# precedence the curses monitor uses so the two surfaces read the same way.
+# Display ordering for states — active work first, then done (completed/cached), then failures.
 STATE_ORDER = ["running", "yielding", "queued", "held", "blocked",
-               "completed", "failed", "cancelled"]
-_STATE_RANK = {s: i for i, s in enumerate(STATE_ORDER)}
+               "completed", "cached", "failed", "cancelled"]
 
 
 class RunView:
@@ -52,9 +51,9 @@ class RunView:
         self.done = False
         self.ok = None
         self.pool: dict = {}
-        self.jobs: dict[str, dict] = {}     # relpath -> latest snapshot (minus envelope keys)
-        self.order: list[str] = []          # relpaths in first-seen (declaration) order
-        self.declared = 0                   # n_jobs reported by server_start
+        self.arts: dict[str, dict] = {}     # relpath -> {relpath, cls, deps, cached, state, ...}
+        self.order: list[str] = []          # relpaths in plan (topological) / first-seen order
+        self.has_plan = False               # did server_start carry the full plan manifest?
         self.project = None
         self.store = None
         self.base_path = None
@@ -110,20 +109,30 @@ class RunView:
         if kind == "server_start":
             if ts is not None:
                 self.started_at = ts
-            self.declared = max(self.declared, int(rec.get("n_jobs", 0) or 0))
             if rec.get("pool"):
                 self.pool = rec["pool"]
             self.project = rec.get("project", self.project)
             self.store = rec.get("store", self.store)
             self.base_path = rec.get("base_path", self.base_path)
-            for relpath in rec.get("jobs", []):  # seed every declared job as queued
-                self._ensure(relpath)
+            plan = rec.get("plan")
+            if plan:                              # full manifest: seed every artifact with its type
+                self.has_plan = True
+                for entry in plan:
+                    self._seed(entry)
+            else:                                 # older log: only the to-build relpaths are known
+                for relpath in rec.get("jobs", []):
+                    self._ensure(relpath)
         elif kind == "job_state":
             relpath = rec.get("relpath")
             if not relpath:
                 return
             self._ensure(relpath)
-            self.jobs[relpath] = {k: v for k, v in rec.items() if k != "type"}
+            prior = self.arts[relpath]
+            merged = {k: v for k, v in rec.items() if k != "type"}
+            merged.setdefault("deps", prior.get("deps", []))
+            merged["cls"] = merged.get("cls") or prior.get("cls")
+            merged["cached"] = False              # a job that emits state ran this session
+            self.arts[relpath] = merged
         elif kind == "pool":
             self.pool = {k: rec[k] for k in ("gpus", "cpus", "memory_mb") if k in rec}
         elif kind == "server_done":
@@ -132,48 +141,40 @@ class RunView:
             if ts is not None:
                 self.ended_at = ts
 
-    def _ensure(self, relpath: str) -> None:
-        if relpath not in self.jobs:
+    def _seed(self, entry: dict) -> None:
+        relpath = entry.get("relpath")
+        if not relpath:
+            return
+        cached = bool(entry.get("cached"))
+        prior = self.arts.get(relpath, {})
+        if relpath not in self.arts:
             self.order.append(relpath)
-            self.jobs[relpath] = {"relpath": relpath, "state": "queued"}
+        self.arts[relpath] = {
+            **prior,
+            "relpath": relpath,
+            "cls": entry.get("cls") or prior.get("cls"),
+            "deps": entry.get("deps") or prior.get("deps") or [],
+            "cached": cached,
+            "state": "cached" if cached else prior.get("state", "queued"),
+        }
+
+    def _ensure(self, relpath: str) -> None:
+        if relpath not in self.arts:
+            self.order.append(relpath)
+            self.arts[relpath] = {"relpath": relpath, "state": "queued", "cached": False, "deps": []}
 
     # ------------------------------------------------------------------ #
     # Derived reads
     # ------------------------------------------------------------------ #
-    def n_jobs(self) -> int:
-        return max(self.declared, len(self.order))
-
     def counts(self) -> dict[str, int]:
         out: dict[str, int] = {}
         for relpath in self.order:
-            state = self.jobs.get(relpath, {}).get("state", "queued")
+            state = self.arts.get(relpath, {}).get("state", "queued")
             out[state] = out.get(state, 0) + 1
         return out
 
-    def labels(self) -> dict[str, str]:
-        """Map each relpath to a short display name: artifact class, ``#i`` when it repeats.
-
-        Indices follow declaration order so they stay stable as states change — the same scheme
-        the curses monitor uses.
-        """
-        totals: dict[str, int] = {}
-        for relpath in self.order:
-            cls = self._cls(relpath)
-            totals[cls] = totals.get(cls, 0) + 1
-        seen: dict[str, int] = {}
-        labels: dict[str, str] = {}
-        for relpath in self.order:
-            cls = self._cls(relpath)
-            i = seen.get(cls, 0)
-            seen[cls] = i + 1
-            labels[relpath] = cls if totals[cls] <= 1 else f"{cls}#{i}"
-        return labels
-
-    def _cls(self, relpath: str) -> str:
-        cls = self.jobs.get(relpath, {}).get("cls")
-        if cls:
-            return cls
-        return relpath.split("/")[0] or relpath   # before the first event: best-effort from path
+    def n_cached(self) -> int:
+        return sum(1 for rp in self.order if self.arts.get(rp, {}).get("cached"))
 
 
 class RunIndex:
@@ -232,38 +233,56 @@ class RunIndex:
     # ------------------------------------------------------------------ #
     # View cache
     # ------------------------------------------------------------------ #
-    def _refresh(self) -> tuple[dict[int, RunView], dict[int, dict]]:
-        dirs = self.discover()
-        live = self._live()
-        with self._lock:
-            for port in list(self._views):           # forget runs whose dir disappeared
-                if port not in dirs:
-                    del self._views[port]
-            for port, logdir in dirs.items():
-                view = self._views.get(port)
-                if view is None or view.logdir != logdir:
-                    view = RunView(port, logdir)
-                    self._views[port] = view
-                view.refresh()
-            return dict(self._views), live
+    def _sync_locked(self, dirs: dict[int, Path]) -> None:
+        """Create/drop/refresh cached views to match ``dirs``. Caller must hold ``_lock``.
+
+        Filesystem/TCP discovery happens *before* the lock; only the in-memory view update and
+        payload build run under it, so a payload is always read from views no other request is
+        mutating concurrently.
+        """
+        for port in list(self._views):              # forget runs whose dir disappeared
+            if port not in dirs:
+                del self._views[port]
+        for port, logdir in dirs.items():
+            view = self._views.get(port)
+            if view is None or view.logdir != logdir:
+                view = RunView(port, logdir)
+                self._views[port] = view
+            view.refresh()
 
     # ------------------------------------------------------------------ #
     # Payloads
     # ------------------------------------------------------------------ #
     def index_payload(self) -> dict:
-        views, live = self._refresh()
+        dirs = self.discover()
+        live = self._live()
         now = time.time()
-        runs = [self._summary(v, p in live, live.get(p), now) for p, v in views.items()]
-        # Live runs first, then most-recently-started.
+        with self._lock:
+            self._sync_locked(dirs)
+            runs = [self._summary(v, p in live, live.get(p), now) for p, v in self._views.items()]
+        runs.sort(key=lambda r: (not r["live"], -(r["started_at"] or 0)))
+        return {"now": now, "runs": runs}
+
+    def overview_payload(self) -> dict:
+        """Every run's *full* detail (steps + instances) — backs the expanded "all runs" view."""
+        dirs = self.discover()
+        live = self._live()
+        now = time.time()
+        with self._lock:
+            self._sync_locked(dirs)
+            runs = [self._detail(v, p in live, live.get(p), now) for p, v in self._views.items()]
         runs.sort(key=lambda r: (not r["live"], -(r["started_at"] or 0)))
         return {"now": now, "runs": runs}
 
     def detail_payload(self, port: int) -> dict | None:
-        views, live = self._refresh()
-        view = views.get(int(port))
-        if view is None:
-            return None
-        return self._detail(view, int(port) in live, live.get(int(port)), time.time())
+        port = int(port)
+        dirs = self.discover()
+        live = self._live()
+        now = time.time()
+        with self._lock:
+            self._sync_locked(dirs)
+            view = self._views.get(port)
+            return self._detail(view, port in live, live.get(port), now) if view else None
 
     def detail_from_view(self, view: RunView, is_live: bool) -> dict:
         """Render a detail payload from a caller-owned view (used by the streaming endpoint)."""
@@ -293,40 +312,102 @@ class RunIndex:
             "started_at": started,
             "ended_at": ended,
             "elapsed": elapsed,
-            "n_jobs": view.n_jobs(),
+            "n_artifacts": len(view.order),
+            "n_cached": view.n_cached(),
             "counts": view.counts(),
             "pool": view.pool,
         }
 
     def _detail(self, view: RunView, is_live: bool, info: dict | None, now: float) -> dict:
         payload = self._summary(view, is_live, info, now)
-        labels = view.labels()
-        payload["jobs"] = [
-            self._job(view.jobs.get(rp, {"relpath": rp, "state": "queued"}),
-                      labels.get(rp, rp), now)
-            for rp in view.order
-        ]
+        arts = [view.arts[rp] for rp in view.order if rp in view.arts]
+        payload["steps"] = _build_steps(arts, now)
         return payload
 
-    def _job(self, job: dict, name: str, now: float) -> dict:
-        relpath = job.get("relpath")
-        started = job.get("started_at")
-        ended = job.get("ended_at")
-        elapsed = ((ended if ended is not None else now) - started) if started else None
-        return {
-            "relpath": relpath,
-            "slug": _slug(relpath) if relpath else None,
-            "name": name,
-            "cls": job.get("cls"),
-            "state": job.get("state", "queued"),
-            "gpus": job.get("gpus", []),
-            "pid": job.get("pid"),
-            "exit_code": job.get("exit_code"),
-            "reason": job.get("reason", ""),
-            "deps": job.get("deps", []),
-            "req": job.get("req", {}),
-            "held": bool(job.get("held", False)),
-            "started_at": started,
-            "ended_at": ended,
-            "elapsed": elapsed,
-        }
+
+# --------------------------------------------------------------------------- #
+# Step grouping — mirror `pipelines plan`: group by artifact type, order by depth.
+# Pure functions over the replayed artifact dicts.
+# --------------------------------------------------------------------------- #
+def _build_steps(arts: list[dict], now: float) -> list[dict]:
+    by_rp = {a["relpath"]: a for a in arts}
+
+    depth: dict[str, int] = {}
+    def depth_of(relpath: str) -> int:
+        if relpath in depth:
+            return depth[relpath]
+        depth[relpath] = 0                            # tentative value breaks any cycle safely
+        best = 0
+        for dep in by_rp.get(relpath, {}).get("deps", []):
+            if dep in by_rp:
+                best = max(best, 1 + depth_of(dep))
+        depth[relpath] = best
+        return best
+    for relpath in by_rp:
+        depth_of(relpath)
+
+    groups: dict[str, list[dict]] = {}
+    for a in arts:
+        groups.setdefault(_type_of(a), []).append(a)
+
+    steps = []
+    for cls, members in groups.items():
+        from_types = sorted({
+            _type_of(by_rp[dep]) for m in members for dep in m.get("deps", [])
+            if dep in by_rp and _type_of(by_rp[dep]) != cls
+        })
+        names = _trim_common([m["relpath"] for m in members])
+        steps.append({
+            "type": cls,
+            "tier": max(depth[m["relpath"]] for m in members),
+            "from_types": from_types,
+            "total": len(members),
+            "instances": [_instance(m, names[m["relpath"]], now) for m in members],
+        })
+    steps.sort(key=lambda s: (s["tier"], s["type"]))     # upstream (inputs) first
+    return steps
+
+
+def _type_of(art: dict) -> str:
+    return art.get("cls") or art["relpath"].split("/")[0] or art["relpath"]
+
+
+def _instance(art: dict, name: str, now: float) -> dict:
+    relpath = art["relpath"]
+    started = art.get("started_at")
+    ended = art.get("ended_at")
+    elapsed = ((ended if ended is not None else now) - started) if started else None
+    return {
+        "relpath": relpath,
+        "slug": _slug(relpath),
+        "name": name,
+        "state": art.get("state", "queued"),
+        "cached": bool(art.get("cached")),
+        "gpus": art.get("gpus", []),
+        "pid": art.get("pid"),
+        "exit_code": art.get("exit_code"),
+        "reason": art.get("reason", ""),
+        "held": bool(art.get("held", False)),
+        "req": art.get("req", {}),
+        "started_at": started,
+        "ended_at": ended,
+        "elapsed": elapsed,
+    }
+
+
+def _trim_common(relpaths: list[str]) -> dict[str, str]:
+    """Strip the longest common leading path segments so instance names show only what differs."""
+    if len(relpaths) <= 1:
+        return {rp: rp for rp in relpaths}
+    segs = [rp.split("/") for rp in relpaths]
+    common = 0
+    for i in range(min(len(s) for s in segs)):
+        if len({s[i] for s in segs}) == 1:
+            common = i + 1
+        else:
+            break
+    out = {}
+    for rp, s in zip(relpaths, segs):
+        rest = s[common:]
+        out[rp] = "/".join(rest) if rest else s[-1]   # never blank: fall back to the last segment
+    return out

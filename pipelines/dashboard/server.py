@@ -9,7 +9,8 @@ Routes
 ------
 ``GET /``                                   the dashboard page (static assets)
 ``GET /api/runs``                           JSON list of every run + summary
-``GET /api/runs/<port>``                    JSON detail of one run (all jobs)
+``GET /api/overview``                       JSON every run's full detail (the expanded view)
+``GET /api/runs/<port>``                    JSON detail of one run, grouped into pipeline steps
 ``GET /api/runs/<port>/stream``             SSE: a snapshot, then live event records
 ``GET /api/runs/<port>/log/<slug>``         a job's full log as text/plain
 ``GET /api/runs/<port>/log/<slug>/stream``  SSE: the log, then live-tailed appends
@@ -82,6 +83,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
         if path == "/api/runs":
             return self._json(self._index.index_payload())
+        if path == "/api/overview":
+            return self._json(self._index.overview_payload())
 
         parts = [p for p in path.split("/") if p]
         if len(parts) >= 3 and parts[:2] == ["api", "runs"] and parts[2].isdigit():

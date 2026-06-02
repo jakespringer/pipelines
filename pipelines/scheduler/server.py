@@ -99,7 +99,8 @@ class RunServer:
 
     def __init__(self, *, specs: list, done: set[str], pool: ResourcePool,
                  worker_argv_prefix: list[str], store: str, base_path: str,
-                 runs_root: Path | None = None, project: str | None = None):
+                 runs_root: Path | None = None, project: str | None = None,
+                 manifest: list[dict] | None = None):
         # Bind first: the port names this run's log dir and the registry entry.
         self._sock, self.port = _bind_server_socket()
         root = Path(runs_root) if runs_root is not None else registry.registry_dir()
@@ -117,6 +118,7 @@ class RunServer:
         self.store = store
         self.base_path = base_path
         self.project = project
+        self.manifest = manifest or []        # full plan (incl. cached) for monitors; display-only
 
         self.events: queue.Queue = queue.Queue()
         self._lock = threading.RLock()                     # guards job-state reads/writes
@@ -141,7 +143,8 @@ class RunServer:
         self.emit("server_start", port=self.port, logdir=str(self.logdir),
                   pool=self.pool.snapshot(), n_jobs=len(self.order),
                   jobs=[j.relpath for j in self.order],
-                  project=self.project, store=self.store, base_path=self.base_path)
+                  project=self.project, store=self.store, base_path=self.base_path,
+                  plan=self.manifest)
         print(f"pipelines: parallel run serving on 127.0.0.1:{self.port}")
         print(f"pipelines: events -> {self.logdir/'events.log'}")
         print(f"pipelines: attach with `pipelines attach {self.port}`")

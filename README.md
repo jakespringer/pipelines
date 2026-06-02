@@ -119,6 +119,24 @@ pipelines -p path/to/proj run a       # or point at the project explicitly
 overrides discovery. Selectors are a group name, `all`, or an `fnmatch` glob over
 `relpath`.
 
+### Running and monitoring in parallel
+
+`runparallel` schedules the graph across the host's GPUs/CPUs (one worker subprocess
+per artifact). Two monitors read the run's event log, so they work from anywhere and
+keep working after the run ends:
+
+```bash
+pipelines runparallel all                 # resource-aware local parallel build
+pipelines attach                          # tmux-style terminal monitor (newest run)
+pipelines dashboard                        # web monitor at http://localhost:7000
+```
+
+`dashboard` is project-independent: it watches the run registry, so every run —
+live or finished, one or many — shows up on its own. The home page lists runs; open
+one to see its jobs grouped by state and resource use; open a job for its live-tailed
+log. Override the port with `--port`, bind beyond localhost with `--all-interfaces`,
+or auto-open a browser with `--open`.
+
 Equivalently, if your project is an importable package you can run its module
 directly — `python -m myproj.run run a` — which is what the `pipelines` command
 does under the hood. The cluster worker entry point is `python -m
@@ -161,10 +179,13 @@ This is an in-progress implementation of the design. Implemented today:
 - Layered-TOML `Project.config`.
 - `LocalExecutor`, in-process `Session`, the `run` / `dryrun` CLI verbs, and the
   `pipelines` console launcher (project discovery + dispatch).
+- `ParallelExecutor` (`runparallel`): a resource-aware local scheduler — one worker
+  subprocess per artifact, GPUs pinned via `CUDA_VISIBLE_DEVICES` — plus the `attach`
+  curses monitor and the `dashboard` web monitor (both read the run's event log).
 
 Not yet implemented (registered as stubs that raise a clear error if used):
-`wandb://` / `http(s)://` store backends and `source.gs`,
-`ParallelExecutor` and `SlurmExecutor`, and the `status` / `cancel` CLI verbs.
+`wandb://` / `http(s)://` store backends and `source.gs`, `SlurmExecutor` (and the
+cluster `worker`), and the `status` / `cancel` CLI verbs.
 See [`docs/11-roadmap-and-conformance.md`](docs/11-roadmap-and-conformance.md).
 
 ## Repository layout
@@ -182,6 +203,8 @@ pipelines/      the installable package
   worker.py     python -m pipelines.worker
   store/        Store ABC + file:// and gs:// backends
   execution/    materialize, graph, batch, executors/
+  scheduler/    runparallel: run server, registry, event log, attach TUI
+  dashboard/    web monitor: run index (event-log replay) + HTTP/SSE server + assets/
 design/         what the user writes and why
 docs/           how it is built (implementation spec)
 examples/       standalone consumer projects (test, em)
