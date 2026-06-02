@@ -61,15 +61,14 @@ A stdlib `ThreadingHTTPServer` serves the single-page UI and a small API:
 | `GET /api/runs/<port>/log/<slug>` | a job's full log as `text/plain` (`?download` to save) |
 | `GET /api/runs/<port>/log/<slug>/stream` | **SSE**: the log so far, then live-tailed appends |
 
-Live data uses Server-Sent Events. The run stream sends one snapshot then forwards each new
-`events.log` record (job state, pool, done) — exactly what the run server broadcasts to a socket
-client, but sourced from the file. The log stream tails `jobs/<slug>.log` from a byte offset.
-
-Two deliberate choices keep the wire robust: **every SSE payload is a JSON value** (so log text with
-arbitrary newlines never collides with SSE's line framing — the client `JSON.parse`s each `data:`),
-and finished/historical runs send their snapshot (or full log) and then `end` immediately, so no
-thread lingers on a run that will never change. Each stream notices a client disconnect on its next
-write; daemon threads mean nothing blocks shutdown.
+**Update model.** The lists (runs, all-runs) and the run-detail view **poll** their JSON endpoints on
+a short interval (≈1.5–2 s) and re-render via keyed diffs — simple and robust: a missed update,
+dropped connection, or re-run is always reconciled on the next tick. The run-detail page also runs a
+1 s client tick so the elapsed clock stays smooth between polls. **Logs** stream over SSE, since
+tailing append-only output is what SSE is for; each SSE payload is a JSON value so log text with
+arbitrary newlines never collides with SSE's line framing. The run-detail SSE stream endpoint still
+exists (snapshot + forwarded `events.log` records) but the UI prefers polling for reliability. SSE
+streams notice a client disconnect on their next write; daemon threads mean nothing blocks shutdown.
 
 `dashboard` is wired in `cli.py` exactly like `attach`: project-independent (handled before project
 discovery), with its own `--port` (default 7000; scans upward if taken) / `--host` / `--open` flags.
@@ -94,23 +93,30 @@ reconcile.
 
 ## 5. `assets/` — the UI
 
-One HTML shell, one stylesheet, one script (vanilla JS — no framework, no build). A hash router swaps
-four views:
+One HTML shell, one stylesheet, one script (vanilla JS — no framework, no build). The layout is a
+standard SaaS shell: a left **sidebar** (brand + nav) and a slim topbar (breadcrumbs + a live-runs
+indicator). A hash router swaps four views:
 
-- **Runs** (`#/`) — a poll of `/api/runs` as run cards (each a small progress bar + state tallies).
-- **All runs** (`#/all`) — a sibling tab that polls `/api/overview` and renders *every* run expanded
+- **Runs** (`#/`) — a poll of `/api/runs` rendered as four **stat cards** (total / active / completed /
+  failed) above a filterable, paginated **table** of runs (status filter + search).
+- **All runs** (`#/all`) — a sidebar view that polls `/api/overview` and renders *every* run expanded
   inline, each with the same step structure.
-- **Run detail** (`#/run/<port>`) — an SSE `snapshot` + live records, rendered as collapsible pipeline
-  steps with pool gauges and an overall progress bar.
+- **Run detail** (`#/run/<port>`) — polls the full snapshot on an interval: stat cards, pool gauges, an
+  overall progress bar, and a **sortable table of pipeline steps** whose rows expand to their instances.
 - **Log** (`#/run/<port>/log/<slug>`) — an SSE tail with follow-on-scroll.
 
-`StepsView` is the shared component for the step list (run-detail and all-runs both feed it). It owns
-its expand state: a step auto-expands while it has active work and collapses when idle, unless the user
-has clicked it — then their choice sticks. Rows are keyed by relpath so live updates never flicker.
-Clicking an instance opens its log; cached instances are shown muted and are not links (they produced
-no log this session). The shared `/api/runs` poll also tracks the server/client clock offset so elapsed
-times survive clock skew. The theme is intentionally restrained — neutral surfaces, a few muted status
-hues used only for small marks, light/dark by OS preference.
+`StepsView` is the shared component for the step list (run-detail and all-runs both feed it). It is a
+continuous table — a row per artifact type, divided by hairlines — with a sortable header in run
+detail (Step / Artifacts / Status / Progress; each header cycles ascending → descending → back to
+pipeline order). It owns its expand state: a step auto-expands while it has active work and collapses
+when idle, unless the user has clicked it — then their choice sticks. An expanded step is itself a
+small sortable sub-table — **Index · Name · Status · Elapsed** — defaulting to status order (running
+on top, cached at the bottom) and sortable by any column, per step. Rows are keyed (by relpath /
+port / type) so live updates and re-sorts never flicker. Clicking an instance opens its log; cached instances are shown muted and are not links
+(they produced no log this session). The shared `/api/runs` poll also tracks the server/client clock
+offset so elapsed times survive clock skew. The theme is intentionally restrained — neutral surfaces, a
+single indigo accent, status hues used only for small marks (dots, thin bars, pills), light/dark by OS
+preference.
 
 ---
 

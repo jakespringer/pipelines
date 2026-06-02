@@ -107,6 +107,12 @@ class RunView:
             self.started_at = ts
 
         if kind == "server_start":
+            # A server_start begins a (re)run. A re-run that reuses the port appends to this same
+            # events.log, so reset per-run state here: the view reflects the *latest* run, and a
+            # re-queued job shows as queued again rather than keeping its previous terminal state.
+            self.arts, self.order = {}, []
+            self.done, self.ok, self.ended_at = False, None, None
+            self.has_plan, self.pool = False, {}
             if ts is not None:
                 self.started_at = ts
             if rec.get("pool"):
@@ -146,16 +152,14 @@ class RunView:
         if not relpath:
             return
         cached = bool(entry.get("cached"))
-        prior = self.arts.get(relpath, {})
         if relpath not in self.arts:
             self.order.append(relpath)
-        self.arts[relpath] = {
-            **prior,
+        self.arts[relpath] = {                    # fresh: server_start reset cleared any prior state
             "relpath": relpath,
-            "cls": entry.get("cls") or prior.get("cls"),
-            "deps": entry.get("deps") or prior.get("deps") or [],
+            "cls": entry.get("cls"),
+            "deps": entry.get("deps") or [],
             "cached": cached,
-            "state": "cached" if cached else prior.get("state", "queued"),
+            "state": "cached" if cached else "queued",
         }
 
     def _ensure(self, relpath: str) -> None:
@@ -230,6 +234,13 @@ class RunIndex:
     def logdir_for(self, port: int) -> Path | None:
         return self.discover().get(int(port))
 
+    def registry_info(self, port: int) -> dict | None:
+        """The registry entry for ``port`` if it still exists (started_at / project / store …)."""
+        try:
+            return json.loads((registry.registry_dir() / f"{int(port)}.json").read_text())
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+
     # ------------------------------------------------------------------ #
     # View cache
     # ------------------------------------------------------------------ #
@@ -284,9 +295,13 @@ class RunIndex:
             view = self._views.get(port)
             return self._detail(view, port in live, live.get(port), now) if view else None
 
-    def detail_from_view(self, view: RunView, is_live: bool) -> dict:
-        """Render a detail payload from a caller-owned view (used by the streaming endpoint)."""
-        return self._detail(view, is_live, None, time.time())
+    def detail_from_view(self, view: RunView, is_live: bool, info: dict | None = None) -> dict:
+        """Render a detail payload from a caller-owned view (used by the streaming endpoint).
+
+        ``info`` is the run's registry entry, if any — it backstops ``started_at`` for the brief
+        window where the snapshot is built before the (large) ``server_start`` line is parsed.
+        """
+        return self._detail(view, is_live, info, time.time())
 
     # --- builders ---------------------------------------------------------- #
     def _status(self, view: RunView, is_live: bool) -> str:

@@ -186,7 +186,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         view = RunView(port, logdir)
         view.refresh()
         live = registry.port_alive(port)
-        if not self._emit(self._index.detail_from_view(view, live), event="snapshot"):
+        info = self._index.registry_info(port)
+        if not self._emit(self._index.detail_from_view(view, live, info), event="snapshot"):
             return
         quiet = time.monotonic()
         while True:

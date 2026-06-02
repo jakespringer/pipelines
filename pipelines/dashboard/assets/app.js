@@ -1,17 +1,15 @@
 "use strict";
 // pipelines dashboard — a small single-page app. No framework, no build step.
 //
-//   • a shared poll of /api/runs drives the header and the dashboard grid
-//   • run detail and log views stream live over Server-Sent Events
-//   • a hash router (#/ , #/all , #/run/<port> , #/run/<port>/log/<slug>) swaps views
+//   • a left sidebar + a shared poll of /api/runs drive navigation and the header
+//   • Runs (#/)  a stat-card summary + a filterable, paginated table of runs
+//   • All runs (#/all)  every run expanded inline (polled /api/overview)
+//   • Run detail (#/run/<port>)  SSE snapshot + live records, grouped into pipeline steps
+//   • Log (#/run/<port>/log/<slug>)  an SSE tail with follow-on-scroll
 //
 // A run's jobs are organized the way `pipelines plan` shows them: grouped by pipeline step
-// (artifact type, ordered by depth). Each step summarizes its instances' states and expands to
-// the individual artifacts; already-committed artifacts are shown as "cached". The StepsView
-// component renders that structure and is shared by the run-detail page and the "all runs" tab.
-//
-// Views are functions that mount into <main> and return { destroy } so the router can tear down
-// timers and event sources cleanly.
+// (artifact type, ordered by depth), already-committed artifacts shown as "cached". The StepsView
+// component renders that and is shared by the run-detail page and the all-runs tab.
 
 // --------------------------------------------------------------------------- //
 // DOM + formatting helpers
@@ -32,13 +30,28 @@ function h(tag, attrs, ...kids) {
   return node;
 }
 
+function svgEl(viewBox, inner, size) {
+  const ns = "http://www.w3.org/2000/svg";
+  const s = document.createElementNS(ns, "svg");
+  s.setAttribute("viewBox", viewBox); s.setAttribute("width", size); s.setAttribute("height", size);
+  s.setAttribute("fill", "none"); s.setAttribute("stroke", "currentColor"); s.setAttribute("stroke-width", "1.8");
+  s.setAttribute("stroke-linecap", "round"); s.setAttribute("stroke-linejoin", "round");
+  s.innerHTML = inner;
+  return s;
+}
+const iconSearch = () => svgEl("0 0 24 24", '<circle cx="11" cy="11" r="7"></circle><path d="M21 21l-3.6-3.6"></path>', 15);
+
 const STATES = ["running", "yielding", "queued", "held", "blocked", "completed", "cached", "failed", "cancelled"];
-const RANK = Object.fromEntries(STATES.map((s, i) => [s, i]));
 const TERMINAL = new Set(["completed", "cached", "failed", "cancelled", "blocked"]);
 const isActive = (s) => s === "running" || s === "yielding";
 
+// Default order for a step's expanded instances: active on top, cached at the bottom.
+const INST_RANK = { running: 0, yielding: 1, queued: 2, held: 3, blocked: 4, failed: 5, cancelled: 6, completed: 7, cached: 8 };
+
 const stateColor = (s) => `var(--${STATES.includes(s) ? s : "queued"})`;
 const dot = (s) => h("span", { class: "dot", style: `background:${stateColor(s)}` });
+// Internal state strings come from the scheduler (e.g. "cancelled"); this is the user-facing label.
+const stateLabel = (s) => s === "cancelled" ? "canceled" : s;
 
 function slugify(v) {              // mirrors pipelines.identity.slug
   return String(v).replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "").replace(/_+/g, "_");
@@ -54,7 +67,7 @@ function fmtDur(s) {
 }
 
 function fmtAgo(ts) {
-  if (!ts) return "";
+  if (!ts) return "—";
   const d = serverNow() - ts;
   if (d < 45) return "just now";
   if (d < 5400) return `${Math.round(d / 60)}m ago`;
@@ -121,7 +134,7 @@ function pill(status) {
 }
 
 function statePill(state) {
-  return h("span", { class: "pill" }, dot(state), state);
+  return h("span", { class: "pill" }, dot(state), stateLabel(state));
 }
 
 function segBar(counts, total, extra) {
@@ -139,27 +152,26 @@ function tallies(counts) {
   const wrap = h("div", { class: "tallies" });
   for (const s of STATES) {
     const n = counts[s] || 0;
-    if (n) wrap.append(h("span", { class: "tally" }, dot(s), h("b", {}, n), s));
+    if (n) wrap.append(h("span", { class: "tally" }, dot(s), h("b", {}, n), stateLabel(s)));
   }
   return wrap;
 }
 
-// Compact tallies (dot + count, word on hover) — for tight headers.
+// Compact tallies (dot + status name + count) — for step / run headers.
 function miniTallies(counts) {
   const wrap = h("span", { class: "mini-tallies" });
   for (const s of STATES) {
     const n = counts[s] || 0;
-    if (n) wrap.append(h("span", { class: "mt" + (isActive(s) ? " run" : ""), title: `${s}: ${n}` }, dot(s), n));
+    if (n) wrap.append(h("span", { class: "mt" + (isActive(s) ? " run" : "") },
+      dot(s), h("span", { class: "mt-name" }, stateLabel(s)), h("b", {}, n)));
   }
   return wrap;
 }
 
-function poolShort(pool) {
-  const bits = [];
-  const g = pool && pool.gpus, c = pool && pool.cpus;
-  if (g && g.total) bits.push(`${g.total - g.free}/${g.total} gpu`);
-  if (c && c.total) bits.push(`${c.total - c.free}/${c.total} cpu`);
-  return bits.join(" · ");
+function statCard(label, num, tone) {
+  return h("div", { class: "stat" },
+    h("div", { class: "label" }, label),
+    h("div", { class: "num" + (tone ? " " + tone : "") }, num));
 }
 
 function setCrumbs(items) {
@@ -171,11 +183,8 @@ function setCrumbs(items) {
   });
 }
 
-function tabs(active) {
-  const tab = (label, href, on) => h("a", { class: "tab" + (on ? " on" : ""), href }, label);
-  return h("div", { class: "tabs" },
-    tab("Runs", "#/", active === "runs"),
-    tab("All runs", "#/all", active === "all"));
+function setNav(section) {
+  for (const a of document.querySelectorAll("[data-nav]")) a.classList.toggle("on", a.dataset.nav === section);
 }
 
 function emptyState() {
@@ -189,16 +198,22 @@ function emptyState() {
 // Shared by the run-detail page (fed via SSE) and the "all runs" tab (polled).
 // Owns its own expand state, keyed so live updates never flicker.
 // --------------------------------------------------------------------------- //
-function StepsView(port) {
-  const el = h("div", { class: "steps" });
+function StepsView(port, opts = {}) {
+  const withHeader = opts.header !== false;       // run detail shows the sortable header; all-runs doesn't
+  const el = h("div", { class: "steps-table" + (withHeader ? "" : " no-head") });
+  const headerEl = withHeader ? h("div", { class: "steps-head steps-grid" }) : null;
+  const emptyRow = h("div", { class: "empty small" }, "No artifacts.");
   const expanded = new Map();   // type -> bool (explicit user choice)
   const toggled = new Set();    // types the user has decided about (overrides the auto rule)
-  const stepEls = new Map();    // type -> { block, head, list, rows, step }
+  const stepEls = new Map();    // type -> { block, head, list, instsHead, rows, step }
+  const instSort = new Map();   // type -> { key, dir } for the per-step instance sub-table
   let steps = [];
+  let sortKey = null, sortDir = -1;   // null = pipeline (server / depth) order
 
+  const doneOf = (s) => s.instances.reduce((n, i) => n + (i.state === "completed" || i.state === "cached" ? 1 : 0), 0);
+  const activeOf = (s) => s.instances.reduce((n, i) => n + (isActive(i.state) ? 1 : 0), 0);
   // A step is open if the user said so, else automatically while it has active work.
-  const isOpen = (step) => toggled.has(step.type) ? !!expanded.get(step.type)
-    : step.instances.some((i) => isActive(i.state));
+  const isOpen = (step) => toggled.has(step.type) ? !!expanded.get(step.type) : activeOf(step) > 0;
 
   function toggle(step) {
     const open = isOpen(step);
@@ -209,15 +224,103 @@ function StepsView(port) {
 
   function setData(next) { steps = next || []; render(); }
 
+  // Each sortable column cycles: pipeline order → primary dir → opposite dir → pipeline order.
+  const defaultDir = (key) => key === "name" ? 1 : -1;
+  function clickSort(key) {
+    if (sortKey !== key) { sortKey = key; sortDir = defaultDir(key); }
+    else if (sortDir === defaultDir(key)) { sortDir = -sortDir; }
+    else { sortKey = null; }
+    render();
+  }
+
+  function sorted() {
+    if (!sortKey) return steps;                   // pipeline order, as the server returned it
+    const value = {
+      name: (s) => s.type.toLowerCase(),
+      count: (s) => s.total,
+      running: (s) => activeOf(s),
+      progress: (s) => s.total ? doneOf(s) / s.total : 0,
+    }[sortKey];
+    return steps.slice().sort((a, b) => {
+      const va = value(a), vb = value(b);
+      if (va < vb) return -sortDir;
+      if (va > vb) return sortDir;
+      return a.type.localeCompare(b.type);
+    });
+  }
+
+  // --- instance sub-table (Index / Name / Status / Elapsed), sortable per step --- //
+  const instDefaultDir = (key) => key === "elapsed" ? -1 : 1;
+  function instSortFor(type) {
+    let s = instSort.get(type);
+    if (!s) { s = { key: "status", dir: 1 }; instSort.set(type, s); }   // default: by status, running on top
+    return s;
+  }
+  function clickInstSort(type, key) {
+    const s = instSortFor(type);
+    if (s.key !== key) { s.key = key; s.dir = instDefaultDir(key); }
+    else { s.dir = -s.dir; }
+    render();
+  }
+  function sortedInstances(step) {
+    const s = instSortFor(step.type);
+    const order = new Map(step.instances.map((it, n) => [it.relpath, n]));   // original (declaration) index
+    const value = {
+      index: (it) => order.get(it.relpath),
+      name: (it) => (it.name || it.relpath).toLowerCase(),
+      status: (it) => INST_RANK[it.state] ?? 99,
+      elapsed: (it) => liveElapsed(it),
+    }[s.key];
+    return step.instances.slice().sort((a, b) => {
+      const va = value(a), vb = value(b);
+      if (s.key === "elapsed") {                       // queued / cached have none → always last
+        if (va == null && vb != null) return 1;
+        if (vb == null && va != null) return -1;
+      }
+      if (va < vb) return -s.dir;
+      if (va > vb) return s.dir;
+      return order.get(a.relpath) - order.get(b.relpath);   // stable tiebreak
+    });
+  }
+  function renderInstsHead(se, step) {
+    const s = instSortFor(step.type);
+    const col = (label, key) => {
+      const c = h("span", { class: "col" + (s.key === key ? " active" : "") },
+        label, h("span", { class: "sort-ic" }, s.key === key ? (s.dir > 0 ? "↑" : "↓") : "↕"));
+      c.addEventListener("click", (e) => { e.stopPropagation(); clickInstSort(step.type, key); });
+      return c;
+    };
+    se.instsHead.replaceChildren(col("Index", "index"), col("Name", "name"), col("Status", "status"), col("Elapsed", "elapsed"));
+  }
+
+  function renderHeader() {
+    if (!headerEl) return;
+    const col = (label, key) => {
+      const c = h("span", { class: "col sortable" + (sortKey === key ? " active" : "") },
+        label, h("span", { class: "sort-ic" }, sortKey === key ? (sortDir > 0 ? "↑" : "↓") : "↕"));
+      c.addEventListener("click", () => clickSort(key));
+      return c;
+    };
+    headerEl.replaceChildren(
+      h("span", {}),                              // caret column spacer
+      col("Step", "name"), col("Artifacts", "count"), col("Status", "running"), col("Progress", "progress"));
+  }
+
   function render() {
-    if (!steps.length) { el.replaceChildren(h("div", { class: "empty small" }, "No artifacts.")); stepEls.clear(); return; }
-    if (el.firstChild && el.firstChild.classList && el.firstChild.classList.contains("empty")) el.firstChild.remove();
+    if (headerEl) { renderHeader(); if (el.firstChild !== headerEl) el.prepend(headerEl); }
+    if (!steps.length) {
+      for (const [, se] of stepEls) se.block.remove();
+      stepEls.clear();
+      if (!emptyRow.isConnected) el.append(emptyRow);
+      return;
+    }
+    if (emptyRow.isConnected) emptyRow.remove();
     const seen = new Set();
-    for (const step of steps) {
+    for (const step of sorted()) {
       let se = stepEls.get(step.type);
       if (!se) { se = makeStep(); stepEls.set(step.type, se); }
       patchStep(se, step);
-      el.append(se.block);                       // keep declared (tier) order; moves existing nodes
+      el.append(se.block);                        // (re)order; moves existing nodes, no flicker
       seen.add(step.type);
     }
     for (const [t, se] of stepEls) if (!seen.has(t)) { se.block.remove(); stepEls.delete(t); }
@@ -226,8 +329,9 @@ function StepsView(port) {
   function makeStep() {
     const se = { step: null };
     se.list = h("div", { class: "insts" });
+    se.instsHead = h("div", { class: "insts-head insts-grid" });
     se.rows = new Map();
-    se.head = h("div", { class: "step-head", onclick: () => se.step && toggle(se.step) });
+    se.head = h("div", { class: "step-head steps-grid", onclick: () => se.step && toggle(se.step) });
     se.block = h("div", { class: "step" }, se.head, se.list);
     return se;
   }
@@ -235,51 +339,54 @@ function StepsView(port) {
   function patchStep(se, step) {
     se.step = step;
     const counts = countsOf(step);
-    const active = step.instances.some((i) => isActive(i.state));
     const open = isOpen(step);
-    se.block.className = "step" + (active ? " active" : "");
     se.head.replaceChildren(
       h("span", { class: "caret" }, open ? "▾" : "▸"),
-      h("span", { class: "step-name" }, step.type),
-      h("span", { class: "step-count" }, "×" + step.total),
-      step.from_types && step.from_types.length
-        ? h("span", { class: "step-from", title: "depends on " + step.from_types.join(", ") }, "← " + step.from_types.join(", "))
-        : null,
-      h("span", { class: "spacer" }),
+      h("div", { class: "step-cell" },
+        h("div", { class: "step-name" }, step.type),
+        step.from_types && step.from_types.length
+          ? h("div", { class: "step-from", title: "depends on " + step.from_types.join(", ") }, "← " + step.from_types.join(", "))
+          : null),
+      h("span", { class: "step-count" }, step.total),
       miniTallies(counts),
-      segBar(counts, step.total, "mini"));
+      h("div", { class: "prog" }, segBar(counts, step.total), h("span", { class: "prog-text" }, `${doneOf(step)}/${step.total}`)));
     if (!open) { se.list.replaceChildren(); se.rows.clear(); se.list.hidden = true; return; }
     se.list.hidden = false;
+    if (se.instsHead.parentNode !== se.list) se.list.prepend(se.instsHead);   // header stays first
+    renderInstsHead(se, step);
+    const origIdx = new Map(step.instances.map((it, n) => [it.relpath, n + 1]));
     const seen = new Set();
-    for (const inst of step.instances) {
+    for (const inst of sortedInstances(step)) {
       let row = se.rows.get(inst.relpath);
       if (!row) { row = makeInst(); se.rows.set(inst.relpath, row); }
-      patchInst(row, inst);
-      se.list.append(row);
+      patchInst(row, inst, origIdx.get(inst.relpath));
+      se.list.append(row);                              // appended after the header, in sort order
       seen.add(inst.relpath);
     }
     for (const [rp, row] of se.rows) if (!seen.has(rp)) { row.remove(); se.rows.delete(rp); }
   }
 
   function makeInst() {
-    return h("a", { class: "inst" },
-      dot("queued"),
+    return h("a", { class: "inst insts-grid" },
+      h("span", { class: "inst-idx" }),
       h("span", { class: "inst-name" }),
-      h("span", { class: "inst-state" }),
-      h("span", { class: "inst-gpus" }),
+      h("span", { class: "inst-status" }, dot("queued"), h("span", { class: "st-text" })),
       h("span", { class: "inst-when" }));
   }
 
-  function patchInst(row, inst) {
-    row.className = "inst s-" + inst.state + (inst.cached ? " cached" : "");
+  function patchInst(row, inst, idx) {
+    row.className = "inst insts-grid s-" + inst.state + (inst.cached ? " cached" : "");
     if (inst.cached) row.removeAttribute("href");
     else row.href = `#/run/${port}/log/${encodeURIComponent(inst.slug || slugify(inst.relpath))}`;
-    row.children[0].style.background = stateColor(inst.state);
+    row.children[0].textContent = idx;
     row.children[1].textContent = inst.name;
     row.children[1].title = inst.relpath;
-    row.children[2].textContent = inst.cached ? "cached" : inst.state + (inst.held ? " · held" : "");
-    row.children[3].textContent = inst.cached ? "" : gpuText(inst);
-    row.children[4].textContent = inst.cached ? "" : elapsedText(inst);
+    const status = row.children[2];
+    status.children[0].style.background = stateColor(inst.state);
+    let text = inst.cached ? "cached" : stateLabel(inst.state) + (inst.held ? " · held" : "");
+    if (!inst.cached && inst.gpus && inst.gpus.length) text += " · gpu " + inst.gpus.join(",");
+    status.children[1].textContent = text;
+    row.children[3].textContent = inst.cached ? "" : elapsedText(inst);
     row.title = inst.reason || inst.relpath;
   }
 
@@ -293,72 +400,130 @@ function countsOf(step) {
 }
 
 // --------------------------------------------------------------------------- //
-// Dashboard (#/) — cards
+// Runs (#/) — stat cards + filterable, paginated table
 // --------------------------------------------------------------------------- //
-function Dashboard(root) {
-  setCrumbs([]);
-  const sub = h("span", { class: "sub" });
-  const cards = h("div", { class: "cards" });
-  root.append(tabs("runs"), h("div", { class: "page-head" }, h("h1", {}, "Runs"), sub), cards);
+const PAGE_SIZE = 12;
 
-  let sig = null;
-  const unsub = Runs.subscribe((data) => {
-    const runs = data.runs || [];
-    sub.textContent = runs.length ? `${runs.length} run${runs.length > 1 ? "s" : ""}` : "";
-    const next = JSON.stringify(runs.map((r) => [r.port, r.status, Math.round(r.elapsed || 0), r.counts, poolShort(r.pool)]));
-    if (next === sig) return;                       // nothing visible changed; skip the churn
-    sig = next;
-    cards.replaceChildren(...(runs.length ? runs.map(runCard) : [emptyState()]));
+function Dashboard(root) {
+  setNav("runs"); setCrumbs([]);
+  let status = "all", query = "", page = 1, sig = null;
+
+  const sub = h("span", { class: "sub" });
+  const stats = h("div", { class: "stats" });
+  const statusSel = h("select", { class: "field", onchange: () => { status = statusSel.value; page = 1; draw(true); } },
+    ...[["all", "All statuses"], ["live", "Live"], ["completed", "Completed"], ["failed", "Failed"], ["interrupted", "Interrupted"]]
+      .map(([v, label]) => h("option", { value: v }, label)));
+  const searchInput = h("input", { type: "search", placeholder: "Search runs" });
+  searchInput.addEventListener("input", () => { query = searchInput.value.trim().toLowerCase(); page = 1; draw(true); });
+  const toolbar = h("div", { class: "toolbar" },
+    statusSel,
+    h("span", { class: "grow" }),
+    h("label", { class: "field search" }, iconSearch(), searchInput));
+  const tableWrap = h("div", { class: "table-wrap" });
+
+  root.append(h("div", { class: "page-head" }, h("h1", {}, "Runs"), sub), stats, toolbar, tableWrap);
+
+  const visible = (runs) => runs.filter((r) => {
+    if (status !== "all" && r.status !== status) return false;
+    if (query) return (r.project || "run").toLowerCase().includes(query) || String(r.port).includes(query);
+    return true;
   });
+
+  function draw(force) {
+    const runs = Runs.data.runs || [];
+    sub.textContent = runs.length ? `${runs.length} run${runs.length > 1 ? "s" : ""}` : "";
+    renderStats(stats, runs);
+    const shown = visible(runs);
+    const pages = Math.max(1, Math.ceil(shown.length / PAGE_SIZE));
+    if (page > pages) page = pages;
+    const slice = shown.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+    const next = JSON.stringify([status, query, page, pages, shown.length,
+      slice.map((r) => [r.port, r.status, Math.round(r.elapsed || 0), r.counts])]);
+    if (!force && next === sig) return;
+    sig = next;
+    if (!runs.length) return tableWrap.replaceChildren(emptyState());
+    if (!shown.length) return tableWrap.replaceChildren(h("div", { class: "empty small" }, "No runs match."));
+    const kids = [runsTable(slice)];
+    if (pages > 1) kids.push(pager(page, pages, shown.length, (n) => { page = n; draw(true); }));
+    tableWrap.replaceChildren(...kids);
+  }
+
+  const unsub = Runs.subscribe(() => draw(false));
   return { destroy: unsub };
 }
 
-function runCard(r) {
-  return h("a", { class: "card", href: `#/run/${r.port}` },
-    h("div", { class: "card-head" },
-      h("span", { class: "card-title" }, r.project || "run"),
-      h("span", { class: "card-port" }, `:${r.port}`),
-      h("span", { style: "margin-left:auto" }, pill(r.status))),
-    h("div", { class: "card-sub" }, cardSub(r)),
-    segBar(r.counts, r.n_artifacts),
-    tallies(r.counts));
+function renderStats(el, runs) {
+  const live = runs.filter((r) => r.live).length;
+  const completed = runs.filter((r) => r.status === "completed").length;
+  const failed = runs.filter((r) => r.status === "failed").length;
+  el.replaceChildren(
+    statCard("Total runs", runs.length),
+    statCard("Active", live, live ? "green" : "muted"),
+    statCard("Completed", completed),
+    statCard("Failed", failed, failed ? "red" : "muted"));
 }
 
-function cardSub(r) {
-  const bits = [];
-  bits.push((r.live ? "running " : (r.status === "completed" || r.status === "failed" ? r.status + " " : "")) + fmtDur(r.elapsed));
-  if (r.started_at) bits.push(fmtAgo(r.started_at));
-  const p = poolShort(r.pool);
-  if (p) bits.push(p);
-  return bits.join("  ·  ");
+function runsTable(rows) {
+  return h("table", { class: "runs" },
+    h("thead", {}, h("tr", {},
+      h("th", {}, "Run"), h("th", {}, "Status"), h("th", {}, "Progress"),
+      h("th", {}, "Started"), h("th", {}, "Duration"))),
+    h("tbody", {}, ...rows.map(runRow)));
+}
+
+function runRow(r) {
+  const c = r.counts || {}, total = r.n_artifacts || 0;
+  const done = (c.completed || 0) + (c.cached || 0);
+  return h("tr", { onclick: () => { location.hash = `#/run/${r.port}`; } },
+    h("td", {}, h("div", { class: "run-name" }, r.project || "run"), h("div", { class: "run-name-sub" }, `:${r.port}`)),
+    h("td", {}, pill(r.status)),
+    h("td", {}, h("div", { class: "prog" }, segBar(c, total), h("span", { class: "prog-text" }, `${done}/${total}`))),
+    h("td", { class: "nowrap muted" }, fmtAgo(r.started_at)),
+    h("td", { class: "nowrap muted num" }, fmtDur(r.elapsed)));
+}
+
+function pager(page, pages, count, go) {
+  const el = h("div", { class: "pager" }, h("span", { class: "count" }, `${count} run${count === 1 ? "" : "s"}`));
+  const btn = (label, n, disabled, on) =>
+    h("span", { class: "pg" + (disabled ? " disabled" : "") + (on ? " on" : ""), onclick: () => { if (!disabled) go(n); } }, label);
+  el.append(btn("‹", page - 1, page <= 1));
+  for (const n of pageList(page, pages)) el.append(n === "…" ? h("span", { class: "pg disabled" }, "…") : btn(String(n), n, false, n === page));
+  el.append(btn("›", page + 1, page >= pages));
+  return el;
+}
+
+function pageList(page, pages) {
+  if (pages <= 7) return Array.from({ length: pages }, (_, i) => i + 1);
+  const keep = [...new Set([1, page - 1, page, page + 1, pages])].filter((n) => n >= 1 && n <= pages).sort((a, b) => a - b);
+  const out = []; let prev = 0;
+  for (const n of keep) { if (n - prev > 1) out.push("…"); out.push(n); prev = n; }
+  return out;
 }
 
 // --------------------------------------------------------------------------- //
 // All runs (#/all) — every run expanded inline, polled
 // --------------------------------------------------------------------------- //
 function Overview(root) {
-  setCrumbs([]);
+  setNav("all"); setCrumbs([]);
+  let query = "", last = { runs: [] };
   const sub = h("span", { class: "sub" });
+  const searchInput = h("input", { type: "search", placeholder: "Search runs" });
+  searchInput.addEventListener("input", () => { query = searchInput.value.trim().toLowerCase(); render(last); });
+  const toolbar = h("div", { class: "toolbar" }, h("span", { class: "grow" }), h("label", { class: "field search" }, iconSearch(), searchInput));
   const list = h("div", { class: "run-list" });
-  root.append(tabs("all"), h("div", { class: "page-head" }, h("h1", {}, "All runs"), sub), list);
+  root.append(h("div", { class: "page-head" }, h("h1", {}, "All runs"), sub), toolbar, list);
 
-  const blocks = new Map();    // port -> { block, head, steps }
+  const blocks = new Map();
   let timer = 0, dead = false;
-
-  async function tick() {
-    if (dead) return;
-    try {
-      render(await api("/api/overview"));
-      timer = setTimeout(tick, 2000);
-    } catch {
-      timer = setTimeout(tick, 3000);
-    }
-  }
+  const match = (r) => !query || (r.project || "run").toLowerCase().includes(query) || String(r.port).includes(query);
 
   function render(data) {
-    const runs = data.runs || [];
-    sub.textContent = runs.length ? `${runs.length} run${runs.length > 1 ? "s" : ""}` : "";
-    if (!runs.length) { list.replaceChildren(emptyState()); blocks.clear(); return; }
+    last = data;
+    const all = data.runs || [];
+    const runs = all.filter(match);
+    sub.textContent = all.length ? `${all.length} run${all.length > 1 ? "s" : ""}` : "";
+    if (!all.length) { list.replaceChildren(emptyState()); blocks.clear(); return; }
+    if (!runs.length) { list.replaceChildren(h("div", { class: "empty small" }, "No runs match.")); blocks.clear(); return; }
     if (list.firstChild && list.firstChild.classList && list.firstChild.classList.contains("empty")) list.firstChild.remove();
     const seen = new Set();
     for (const r of runs) {
@@ -371,19 +536,23 @@ function Overview(root) {
     for (const [p, b] of blocks) if (!seen.has(p)) { b.block.remove(); blocks.delete(p); }
   }
 
+  async function tick() {
+    if (dead) return;
+    try { render(await api("/api/overview")); timer = setTimeout(tick, 2000); }
+    catch { timer = setTimeout(tick, 3000); }
+  }
   tick();
   return { destroy() { dead = true; clearTimeout(timer); } };
 }
 
 function makeRunBlock(port) {
   const head = h("a", { class: "run-head", href: `#/run/${port}` });
-  const steps = StepsView(port);
+  const steps = StepsView(port, { header: false });
   return { block: h("div", { class: "run-block" }, head, steps.el), head, steps };
 }
 
 function patchRunBlock(b, r) {
-  const c = r.counts || {};
-  const total = r.n_artifacts || 0;
+  const c = r.counts || {}, total = r.n_artifacts || 0;
   const done = (c.completed || 0) + (c.cached || 0);
   b.head.replaceChildren(
     h("span", { class: "run-title" }, r.project || "run"),
@@ -397,53 +566,28 @@ function patchRunBlock(b, r) {
 }
 
 // --------------------------------------------------------------------------- //
-// Run detail (#/run/<port>) — SSE snapshot + live event records
+// Run detail (#/run/<port>) — polls the full snapshot on an interval
 // --------------------------------------------------------------------------- //
 function RunDetail(root, port) {
-  setCrumbs([{ label: `run :${port}` }]);
+  setNav("runs"); setCrumbs([{ label: `run :${port}` }]);
   const head = h("div", { class: "page-head" });
-  const meta = h("div", { class: "meta-row" });
+  const stats = h("div", { class: "stats" });
   const gauges = h("div", { class: "gauges" });
   const overall = h("div", { class: "overall" });
   const stepsView = StepsView(port);
-  root.append(head, meta, gauges, overall, stepsView.el);
+  root.append(head, stats, gauges, overall, stepsView.el);
 
   const M = { status: "", live: false, started_at: null, ended_at: null, project: null,
-              store: null, logdir: null, n_cached: 0, pool: {}, steps: [], index: new Map() };
-  let raf = 0, dead = false;
-
-  function reindex() {
-    M.index.clear();
-    for (const st of M.steps) for (const inst of st.instances) M.index.set(inst.relpath, inst);
-  }
+              pool: {}, steps: [] };
+  let raf = 0, dead = false, timer = 0;
 
   function applySnapshot(d) {
     Object.assign(M, {
       status: d.status, live: d.live, started_at: d.started_at, ended_at: d.ended_at,
-      project: d.project, store: d.store, logdir: d.logdir, n_cached: d.n_cached || 0,
-      pool: d.pool || {}, steps: d.steps || [],
+      project: d.project, pool: d.pool || {}, steps: d.steps || [],
     });
-    reindex();
     setCrumbs([{ label: (d.project ? d.project + " " : "") + `:${port}` }]);
     render();
-  }
-
-  function applyRecord(rec) {
-    if (rec.type === "job_state" && rec.relpath) {
-      const inst = M.index.get(rec.relpath);
-      if (inst) {
-        for (const k of ["state", "gpus", "pid", "exit_code", "reason", "held", "started_at", "ended_at"])
-          if (k in rec) inst[k] = rec[k];
-        inst.cached = false;
-      }
-    } else if (rec.type === "pool") {
-      M.pool = { gpus: rec.gpus, cpus: rec.cpus, memory_mb: rec.memory_mb };
-    } else if (rec.type === "server_done") {
-      M.live = false;
-      M.status = rec.ok ? "completed" : "failed";
-      M.ended_at = M.ended_at || serverNow();
-    }
-    scheduleRender();
   }
 
   const scheduleRender = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; render(); }); };
@@ -454,20 +598,21 @@ function RunDetail(root, port) {
     head.replaceChildren(
       h("h1", {}, M.project || "run"),
       pill(M.status),
-      h("span", { class: "sub" }, `${M.live ? "running" : M.status} · ${fmtDur(elapsed)}`));
+      h("span", { class: "sub" }, `${M.live ? "running" : M.status} · ${fmtDur(elapsed)} · started ${fmtAgo(M.started_at)}`));
 
+    const counts = allCounts();
     const total = M.steps.reduce((n, s) => n + s.total, 0);
-    const m = [kv("artifacts", total)];
-    if (M.n_cached) m.push(kv("cached", M.n_cached));
-    if (M.started_at) m.push(kv("started", fmtAgo(M.started_at)));
-    if (M.store) m.push(kv("store", M.store, true));
-    if (M.logdir) m.push(kv("logs", M.logdir, true));
-    meta.replaceChildren(...m);
+    const running = (counts.running || 0) + (counts.yielding || 0);
+    const done = (counts.completed || 0) + (counts.cached || 0);
+    const failed = (counts.failed || 0) + (counts.cancelled || 0);
+    stats.replaceChildren(
+      statCard("Artifacts", total),
+      statCard("Running", running, running ? "green" : "muted"),
+      statCard("Done", done),
+      statCard("Failed", failed, failed ? "red" : "muted"));
 
     gauges.replaceChildren(...gaugeEls(M.pool));
 
-    const counts = allCounts();
-    const done = (counts.completed || 0) + (counts.cached || 0);
     overall.replaceChildren(
       h("div", { class: "overall-line" },
         h("span", { class: "overall-label" }, `${done} / ${total} done`),
@@ -483,18 +628,23 @@ function RunDetail(root, port) {
     return c;
   }
 
-  const es = new EventSource(`/api/runs/${port}/stream`);
-  es.addEventListener("snapshot", (e) => applySnapshot(JSON.parse(e.data)));
-  es.addEventListener("end", () => { es.close(); render(); });
-  es.onmessage = (e) => applyRecord(JSON.parse(e.data));
+  // Poll the full snapshot on an interval. This is robust against missed events, dropped
+  // connections, and re-runs (a re-run that reuses the port appends to the same log; the server
+  // resets its view on each server_start, so re-queued jobs come back as queued). A 1s tick keeps
+  // the elapsed clock smooth between polls.
+  async function poll() {
+    if (dead) return;
+    try {
+      const d = await api(`/api/runs/${port}`);
+      if (d) applySnapshot(d);
+    } catch { /* transient — retry next interval */ }
+    if (!dead) timer = setTimeout(poll, 2000);
+  }
+  poll();
 
-  const tick = setInterval(() => { if (M.live) scheduleRender(); }, 1000);  // keep elapsed live
+  const tick = setInterval(() => { if (M.live) scheduleRender(); }, 1000);
 
-  return { destroy() { dead = true; es.close(); clearInterval(tick); } };
-}
-
-function kv(k, v, mono) {
-  return h("div", {}, h("span", { class: "k" }, k), h("span", { class: "v" + (mono ? " mono" : "") }, v));
+  return { destroy() { dead = true; clearTimeout(timer); clearInterval(tick); } };
 }
 
 function gaugeEls(pool) {
@@ -521,6 +671,7 @@ function gauge(label, used, total, unit) {
 // Log view (#/run/<port>/log/<slug>) — SSE tail with follow-on-scroll
 // --------------------------------------------------------------------------- //
 function LogView(root, port, slug) {
+  setNav("runs");
   root.className = "wide";
   setCrumbs([{ label: `run :${port}`, href: `#/run/${port}` }, { label: slug }]);
 
@@ -635,12 +786,17 @@ function route() {
 
 function initHeader() {
   const conn = document.getElementById("conn");
+  const footDot = document.getElementById("foot-dot");
+  const footText = document.getElementById("foot-text");
   Runs.subscribe((data, ok) => {
-    const live = (data.runs || []).filter((r) => r.live).length;
+    const runs = data.runs || [];
+    const live = runs.filter((r) => r.live).length;
     conn.classList.toggle("active", live > 0);
     conn.classList.toggle("disconnected", ok === false);
     conn.replaceChildren(h("span", { class: "pulse" }),
       h("span", {}, ok === false ? "disconnected" : live ? `${live} active` : "idle"));
+    if (footDot) footDot.classList.toggle("live", live > 0);
+    if (footText) footText.textContent = ok === false ? "disconnected" : runs.length ? `${runs.length} run${runs.length === 1 ? "" : "s"}` : "watching runs";
   });
 }
 
