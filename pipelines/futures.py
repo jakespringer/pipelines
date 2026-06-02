@@ -11,6 +11,7 @@ import with ``artifact.py``.
 from __future__ import annotations
 
 import dataclasses
+import logging
 from typing import Callable, Generic, TypeVar
 
 from . import runtime
@@ -190,12 +191,18 @@ def _edges_of(v) -> list:
 
 def resolve_future_fields(a):
     """Resolve any ``Future``-valued field into a concrete clone (automaterialize path)."""
+    log = runtime._CTX.get().log if runtime._CTX.get() else logging.getLogger("pipelines")
     repl = {}
     for f in dataclasses.fields(a):
         v = getattr(a, f.name)
         if isinstance(v, Future):
+            log.info("future: resolving field %r of %r", f.name, a.relpath)
             chosen = v.result()
             if _is_artifact(chosen):
+                log.info("future: field %r resolved to artifact %r; retrieving",
+                         f.name, chosen.relpath)
                 chosen.retrieve()
+            else:
+                log.info("future: field %r resolved to value %r", f.name, chosen)
             repl[f.name] = chosen
     return dataclasses.replace(a, **repl) if repl else a

@@ -73,7 +73,10 @@ bare `relpath` against its selected Store, since nothing is rebuilt.)
 | Command | What it does |
 |---------|--------------|
 | `run [SELECTOR…] [--target G] [--force/--force-all] [--head/--tail N] [--executor X]` | Build the selection ([06](06-execution.md)). |
+| `runparallel [SELECTOR…] [--gpus/--cpus/--memory N] [--force] [--dry]` | **(implemented)** Resource-aware local parallel build via the run server; auto-detects host resources unless overridden. |
+| `attach [PORT]` | **(implemented)** tmux-style live monitor for a parallel run (newest live run if `PORT` omitted). |
 | `dryrun [SELECTOR…]` | Plan + order + freshness + future planning; print plan, `relpath`s, paths, automatically resolved selections or user-managed future fields, and (Slurm) `sbatch`/`afterok` wiring — without building. |
+| `plan [SELECTOR…] [--expand] [--nofresh]` | **(implemented)** Condensed ASCII view of the scheduler plan — collapses artifacts **by type** (counts) and **by repetition** (the per-artifact DAG projected onto a per-type DAG, fan-out shown as `2× per A`, fan-in noted inline). `--expand` lists instances; `--nofresh` skips the committed-vs-build check. |
 | `status [SELECTOR…]` | Per-artifact state: committed / running / queued / failed / blocked, with job ids. |
 | `logs SELECTOR` | Stream/tail an artifact's log (or its Slurm job log). |
 | `ls [SELECTOR]` | List store contents by `relpath` with size, age. |
@@ -156,6 +159,27 @@ graph and makes safe invalidation possible: before you `rm` a model, see what wo
    inputs.
 4. Fix; delete the stale output (or `--force`) since there's no fingerprint
    ([02](02-identity-and-storage.md) §3); rebuild just it; resume the rest.
+
+---
+
+## 6a. Verbosity / narration — `PIPELINES_VERBOSITY`
+
+The whole framework logs to a single `logging.getLogger("pipelines")` logger, which is **unconfigured
+by default** — a library should not print uninvited. Set `PIPELINES_VERBOSITY` to a standard level
+name to attach a stderr handler that narrates what the framework is doing:
+
+```bash
+PIPELINES_VERBOSITY=info pipelines run baseline
+```
+
+At `info` the narration covers the interesting seams: the graph collection and freshness pass, each
+`materialize` decision (cache hit/miss, dependency readying, construct, commit), future-field
+resolution, session open/reuse, and — most concretely — every Store existence check **together with
+how it resolved** (e.g. "checking whether `…` is committed (dir `/…`)" immediately followed by "`…`
+exists (committed)" / "does not exist (not committed)"), plus retrieve/publish/delete. Accepted
+values are the usual levels (`debug`, `info`, `warning`, `error`, `critical`, case-insensitive);
+unset/empty/unrecognized leaves logging untouched (quiet). Configured once at package import by
+`pipelines.configure_logging()`.
 
 ---
 

@@ -3,7 +3,9 @@ name = "test"
 
 [config]
 # These defaults make the example runnable without external services.
-input_dir = "examples/test/data"
+# A relative input_dir is resolved against this example's directory (see
+# artifacts.py), so the example runs from any working directory.
+input_dir = "data"
 document_names = ["alpha", "beta", "gamma"]
 text_case_modes = ["lower", "upper"]
 remove_words = ["the", "and"]

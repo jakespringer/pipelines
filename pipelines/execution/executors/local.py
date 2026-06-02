@@ -20,14 +20,18 @@ log = logging.getLogger("pipelines")
 
 
 class LocalExecutor:
-    def __init__(self, store, base_path):
+    def __init__(self, store, base_path, *, conda_env=None, python_bin=None):
         self.store = str(store)
         self.base_path = _as_path(base_path)
+        # Subprocess shell-outs (``run(python(...), ...)``) land in this env;
+        # unset => bare ``python``, i.e. the orchestrator's own environment.
+        self.python = runtime.python_prefix(conda_env, python_bin)
         Store.from_uri(self.store)              # validate scheme early
 
     # ------------------------------------------------------------------ #
     def run(self, targets, *, dry: bool = False, force: bool = False) -> int:
-        rc = RuntimeContext(base_path=self.base_path, executor_store=self.store, log=log)
+        rc = RuntimeContext(base_path=self.base_path, executor_store=self.store,
+                            log=log, python=self.python)
         token = runtime._CTX.set(rc)
         cache_token = runtime._RESULT_CACHE.set({})
         sessions: dict = {}
@@ -74,8 +78,11 @@ def _ensure_session(a, sessions: dict, rc: RuntimeContext):
     probe = cls()
     key = (cls, tuple(probe.group_key(a)))
     if key not in sessions:
+        log.info("session: opening %s for group %s", cls.__name__, key[1])
         probe.open(a, rc)
         sessions[key] = probe
+    else:
+        log.info("session: reusing open %s for group %s", cls.__name__, key[1])
     return sessions[key]
 
 

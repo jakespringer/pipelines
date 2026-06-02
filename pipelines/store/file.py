@@ -7,6 +7,7 @@ Atomicity is provided by ``os.replace`` of a fully-staged directory: the committ
 from __future__ import annotations
 
 import fnmatch
+import logging
 import os
 import shutil
 import uuid
@@ -14,6 +15,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .base import Store, register
+
+log = logging.getLogger("pipelines")
 
 
 def _uri_to_path(uri: str) -> Path:
@@ -34,29 +37,43 @@ class FileStore(Store):
         return self._root / relpath
 
     def exists(self, relpath: str) -> bool:
-        return self._final(relpath).is_dir()
+        final = self._final(relpath)
+        log.info("file store: checking whether %r is committed (dir %s)", relpath, final)
+        result = final.is_dir()
+        log.info("file store: %r %s", relpath,
+                 "exists (committed)" if result else "does not exist (not committed)")
+        return result
 
     def get_dir(self, relpath: str, dest: Path, only: list[str] | None = None) -> None:
         src = self._final(relpath)
+        log.info("file store: retrieving %r from %s into %s%s", relpath, src, dest,
+                 f" (only {only})" if only else "")
         if not src.is_dir():
+            log.info("file store: %r is not committed; cannot retrieve", relpath)
             raise FileNotFoundError(f"not committed at {relpath!r} in {self.root}")
         _copy_tree(src, Path(dest), only)
+        log.info("file store: retrieved %r into %s", relpath, dest)
 
     def put_dir(self, src: Path, relpath: str) -> None:
         src = Path(src)
         final = self._final(relpath)
+        log.info("file store: publishing %s to %r (final %s)", src, relpath, final)
         final.parent.mkdir(parents=True, exist_ok=True)
         staging = final.parent / f".staging-{final.name}-{uuid.uuid4().hex}"
         _copy_tree(src, staging, None)
         # Finalize atomically. Clobbering an existing publication is intentional.
         if final.exists():
+            log.info("file store: %r already exists; clobbering prior publication", relpath)
             trash = final.parent / f".trash-{final.name}-{uuid.uuid4().hex}"
             os.replace(final, trash)
             shutil.rmtree(trash, ignore_errors=True)
         os.replace(staging, final)
+        log.info("file store: published %r", relpath)
 
     def delete(self, relpath: str) -> None:
-        shutil.rmtree(self._final(relpath), ignore_errors=True)
+        final = self._final(relpath)
+        log.info("file store: deleting %r (dir %s, exists=%s)", relpath, final, final.is_dir())
+        shutil.rmtree(final, ignore_errors=True)
 
 
 def _copy_tree(src: Path, dst: Path, only: list[str] | None) -> None:

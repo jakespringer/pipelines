@@ -67,18 +67,29 @@ does by default, and what running a script's `cli(...)` with `--executor local` 
 
 ---
 
-## 4. `ParallelExecutor` — local, resource-aware
+## 4. `ParallelExecutor` — local, resource-aware  *(implemented)*
 
 Build independent artifacts concurrently on one machine, respecting resources:
 
-```python
-run(targets, executor=ParallelExecutor(slots={"gpu": 8, "cpu": 32}))
+```bash
+pipelines runparallel baseline                  # auto-detects host GPUs/CPUs/memory
+pipelines runparallel scaling --gpus 8 --cpus 32 --memory 256G   # explicit caps
+pipelines runparallel all --dry                 # plan + per-artifact resources, no build
 ```
 
-A scheduler loop keeps a ready-set and launches artifacts whose resource intent (the `gpus`/`cpus`
-keys from `annotations` — [08](08-runtime-and-cluster.md) §6) fits free slots. Each builds in a
-worker subprocess (isolation), pinned via `CUDA_VISIBLE_DEVICES`. The worker entry point is the same
-`materialize` primitive (`--only <relpath> --strict`).
+A **run server** keeps a ready-set and launches each artifact whose dependencies are met and whose
+resource intent (the `gpus`/`cpus`/`memory` keys from `annotations` — [08](08-runtime-and-cluster.md)
+§7) fits the free pool. Each builds in a worker subprocess (isolation), pinned via
+`CUDA_VISIBLE_DEVICES` to concrete GPU ids the scheduler hands out. The worker is the same
+`materialize` primitive in **strict** mode, re-entered through the hidden `pipelines _worker --only
+<relpath>` verb (it re-imports the project, so the graph is rebuilt cheaply per job).
+
+The server also serves a monitor/control API on a TCP port (16400+), writes an agent-parsable
+JSON-lines event log, and per-job captured output. **Cooperative yielding:** a job can call
+`pipelines.runtime.yield_now()` (or set `PIPELINES_YIELD=1`, which auto-yields right before its
+commit/upload) to hand its GPUs/CPUs back to the scheduler while it finishes saving/uploading — it
+shows as *yielding* until it exits. See [09](09-cli-and-observability.md) for `pipelines attach`, the
+tmux-style live monitor.
 
 ---
 

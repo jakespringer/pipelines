@@ -21,9 +21,13 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+gs = ["google-cloud-storage"]  # gs:// store backend
 hf = ["huggingface_hub"]       # source.hf(...) external retrieval
 analysis = ["pandas"]          # gather(...).to_frame()
-all = ["huggingface_hub", "pandas"]
+all = ["google-cloud-storage", "huggingface_hub", "pandas"]
+
+[project.scripts]
+pipelines = "pipelines.cli:main"     # also: python -m pipelines.worker (cluster worker)
 
 [tool.setuptools.packages.find]
 include = ["pipelines*"]

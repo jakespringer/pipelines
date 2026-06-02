@@ -104,14 +104,25 @@ if __name__ == "__main__":
     )
 ```
 
+Installing the package puts a `pipelines` command on your PATH. It finds the
+project's `run.py` and dispatches the verb to it:
+
 ```bash
-python -m myproj.run dryrun all      # show what would build
-python -m myproj.run run a           # build group "a"
-python -m myproj.run run "model/*"   # build by relpath glob
+pipelines dryrun all                  # from a dir with run.py + pipelines.toml
+pipelines run a                       # build group "a"
+pipelines run "model/*"               # build by relpath glob
+pipelines -p path/to/proj run a       # or point at the project explicitly
 ```
 
-Selectors are a group name, `all`, or an `fnmatch` glob over `relpath`. The
-cluster worker entry point is `python -m pipelines.worker`.
+`pipelines` discovers the project by walking up from the current directory for a
+`run.py` beside a `pipelines.toml`; `-p/--project DIR` (or a path to a `run.py`)
+overrides discovery. Selectors are a group name, `all`, or an `fnmatch` glob over
+`relpath`.
+
+Equivalently, if your project is an importable package you can run its module
+directly — `python -m myproj.run run a` — which is what the `pipelines` command
+does under the hood. The cluster worker entry point is `python -m
+pipelines.worker`.
 
 ### Configuration
 
@@ -143,13 +154,16 @@ This is an in-progress implementation of the design. Implemented today:
 
 - `@artifact` (frozen dataclass + footgun guards), `relpath` identity, and the
   default `retrieve`/`exists`/`commit` lifecycle.
-- `file://` store backend; `source.local` / `source.hf` / `source.url`.
+- `file://` and `gs://` store backends; `source.local` / `source.hf` /
+  `source.url`. The `gs://` backend (extra: `pipelines[gs]`) finalizes commits
+  with a manifest object, so half-uploaded directories read as not-committed.
 - `@derived` and the `Future` combinators.
 - Layered-TOML `Project.config`.
-- `LocalExecutor`, in-process `Session`, and the `run` / `dryrun` CLI verbs.
+- `LocalExecutor`, in-process `Session`, the `run` / `dryrun` CLI verbs, and the
+  `pipelines` console launcher (project discovery + dispatch).
 
 Not yet implemented (registered as stubs that raise a clear error if used):
-`gs://` / `wandb://` / `http(s)://` store backends and `source.gs`,
+`wandb://` / `http(s)://` store backends and `source.gs`,
 `ParallelExecutor` and `SlurmExecutor`, and the `status` / `cancel` CLI verbs.
 See [`docs/11-roadmap-and-conformance.md`](docs/11-roadmap-and-conformance.md).
 
@@ -166,7 +180,7 @@ pipelines/      the installable package
   runtime.py    ctx, workspace, run/sh, free_port, slug, ...
   cli.py        cli(groups=..., executor=...)
   worker.py     python -m pipelines.worker
-  store/        Store ABC + file:// (and gs:// stub)
+  store/        Store ABC + file:// and gs:// backends
   execution/    materialize, graph, batch, executors/
 design/         what the user writes and why
 docs/           how it is built (implementation spec)

@@ -21,6 +21,8 @@ BUNDLE_FILE = "bundle.json"
 META_FILE = "meta.json"
 AUDIT_FILE = "audit.json"
 
+_PROJECT_DIR = Path(__file__).resolve().parent
+
 
 @artifact
 class LocalDocument:
@@ -33,11 +35,10 @@ class LocalDocument:
         return f"source/{slug(self.name)}"
 
     def retrieve(self, *, only=None) -> None:
-        source.local(
-            Path(Project.config.input_dir) / self.name,
-            into=self.path,
-            only=only,
-        )
+        root = Path(Project.config.input_dir)
+        if not root.is_absolute():
+            root = _PROJECT_DIR / root   # portable: relative to this example, not cwd
+        source.local(root / self.name, into=self.path, only=only)
 
 
 @artifact

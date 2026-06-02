@@ -31,6 +31,13 @@ class _ConfigView:
         except KeyError:
             raise ConfigKeyError(key, self._system_path) from None
 
+    def get(self, key, default=None):
+        """Optional read: the value for ``key`` or ``default`` if unset.
+
+        Unlike attribute access, this never raises :class:`ConfigKeyError` — use it
+        for keys a project may legitimately leave unconfigured."""
+        return self._data.get(key, default)
+
     def to_dict(self) -> dict:
         return dict(self._data)
 

@@ -8,6 +8,9 @@ from . import experiment_merge as merge
 from . import experiment_selection as selection
 from . import experiment_variants as variants
 
+import warnings
+warnings.filterwarnings("ignore", "Your application has authenticated using end user credentials")
+
 
 if __name__ == "__main__":
     cli(
