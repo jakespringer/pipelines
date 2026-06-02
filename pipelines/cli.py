@@ -75,6 +75,11 @@ def _dispatch(groups: dict[str, list], executor, argv: list[str] | None = None) 
         from .scheduler.tui import attach_main
         return attach_main(positionals)
 
+    # `dashboard` serves a web monitor for every run; like `attach`, no targets/executor.
+    if verb == "dashboard":
+        from .dashboard.server import dashboard_main
+        return dashboard_main(rest)
+
     # Hidden worker verb: build exactly one artifact (used by ParallelExecutor subprocesses).
     if verb == "_worker":
         return _run_worker(groups, opts)
@@ -94,7 +99,7 @@ def _dispatch(groups: dict[str, list], executor, argv: list[str] | None = None) 
     if verb == "plan":
         return _run_plan(executor, targets, flags)
     print(f"unknown command {verb!r} "
-          f"(have: run, dryrun, runparallel, plan, attach)", file=sys.stderr)
+          f"(have: run, dryrun, runparallel, plan, attach, dashboard)", file=sys.stderr)
     return 2
 
 
@@ -276,10 +281,11 @@ def _universe(groups: dict[str, list]) -> dict:
 
 
 def _usage(groups: dict[str, list]) -> int:
-    print("usage: <run|dryrun|plan|runparallel|attach> [SELECTOR ...]")
+    print("usage: <run|dryrun|plan|runparallel|attach|dashboard> [SELECTOR ...]")
     print("  plan [SEL...] [--expand] [--nofresh] [--light|--dark] [--no-color]")
     print("  runparallel [SEL...] [--gpus N --cpus N --memory 64G] [--force] [--dry]")
     print("  attach [PORT]            monitor a running parallel run (tmux-style TUI)")
+    print("  dashboard [--port 7000]  serve a web monitor for all runs (live + past)")
     print("groups:", ", ".join(sorted(groups)) or "(none)")
     return 0
 
@@ -347,6 +353,12 @@ def main(argv: list[str] | None = None) -> int:
     if rest and rest[0] == "attach":
         from .scheduler.tui import attach_main
         return attach_main([a for a in rest[1:] if not a.startswith("-")])
+
+    # `dashboard` is likewise project-independent: it watches the registry directory and
+    # serves a web monitor for every run. Its own flags (--port/--host) pass through verbatim.
+    if rest and rest[0] == "dashboard":
+        from .dashboard.server import dashboard_main
+        return dashboard_main(rest[1:])
 
     run_file = _discover_run_file(project)
     project_dir = run_file.parent

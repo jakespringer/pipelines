@@ -140,7 +140,8 @@ class RunServer:
 
         self.emit("server_start", port=self.port, logdir=str(self.logdir),
                   pool=self.pool.snapshot(), n_jobs=len(self.order),
-                  jobs=[j.relpath for j in self.order])
+                  jobs=[j.relpath for j in self.order],
+                  project=self.project, store=self.store, base_path=self.base_path)
         print(f"pipelines: parallel run serving on 127.0.0.1:{self.port}")
         print(f"pipelines: events -> {self.logdir/'events.log'}")
         print(f"pipelines: attach with `pipelines attach {self.port}`")

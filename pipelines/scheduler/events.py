@@ -7,7 +7,9 @@ same records to attached clients (see :mod:`server`).
 
 Event ``type`` values (and their salient fields):
 
-* ``server_start``  — ``port``, ``logdir``, ``pool`` (resource snapshot), ``n_jobs``
+* ``server_start``  — ``port``, ``logdir``, ``pool`` (resource snapshot), ``n_jobs``, ``jobs``
+                       (the relpaths), and the run identity ``project`` / ``store`` / ``base_path``
+                       (so the log is self-describing for tools that replay it after the run ends)
 * ``job_state``     — ``relpath``, ``state``, plus whatever changed (``gpus``, ``pid``,
                        ``exit_code``, ``reason``)
 * ``pool``          — current :meth:`ResourcePool.snapshot`

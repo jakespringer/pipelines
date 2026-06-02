@@ -31,3 +31,6 @@ pipelines = "pipelines.cli:main"     # also: python -m pipelines.worker (cluster
 
 [tool.setuptools.packages.find]
 include = ["pipelines*"]
+
+[tool.setuptools.package-data]
+"pipelines.dashboard" = ["assets/*"]   # the web UI (html/css/js) shipped with the package
