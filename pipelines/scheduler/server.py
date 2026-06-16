@@ -24,8 +24,8 @@ import uuid
 from pathlib import Path
 
 from ..identity import slug
+from ..reporting import Reporter, short_hostname
 from . import protocol, registry
-from .events import EventLog
 from .resources import Assignment, ResourcePool, ResourceRequest
 
 log = logging.getLogger("pipelines")
@@ -107,11 +107,20 @@ class RunServer:
         self.logdir = root / str(self.port)
         self.logdir.mkdir(parents=True, exist_ok=True)
         (self.logdir / "jobs").mkdir(exist_ok=True)
-        self.eventlog = EventLog(self.logdir / "events.log")
+        self.started_at = time.time()
+        # The local logdir stays port-keyed (so `pipelines attach` is unchanged); the dashboard,
+        # which a remote job ships to, needs an id unique across every host reporting to it.
+        self.remote_run_id = f"{short_hostname()}-{int(self.started_at)}-{os.getpid()}"
+        self.reporter = Reporter.open(
+            events_path=self.logdir / "events.log", run_id=self.remote_run_id,
+            meta={"project": project, "store": store, "base_path": base_path,
+                  "started_at": self.started_at},
+            on_record=self._broadcast)
 
         # specs: list of (artifact, dep_relpaths). Build Job objects now that logdir exists.
         self.order = [Job(a, deps, job_log_path(self.logdir, a.relpath)) for a, deps in specs]
         self.jobs = {j.relpath: j for j in self.order}
+        self._level = self._compute_levels()              # BFS depth per job (homogeneous launch order)
         self.done = set(done)                              # satisfied (pre-committed) relpaths
         self.pool = pool
         self.worker_argv_prefix = worker_argv_prefix
@@ -125,7 +134,6 @@ class RunServer:
         self._clients: list[_Client] = []
         self._tokens: dict[str, str] = {}                  # yield-token -> relpath
         self._stop = threading.Event()
-        self.started_at = time.time()
 
     # ------------------------------------------------------------------ #
     # Public entry
@@ -247,6 +255,8 @@ class RunServer:
     # Launching
     # ------------------------------------------------------------------ #
     def _try_launch(self) -> None:
+        # Resolve dependency-driven states for queued jobs, and collect those ready to run.
+        ready = []
         for job in self.order:
             if job.state != "queued":
                 continue
@@ -263,9 +273,48 @@ class RunServer:
                 job.reason = f"unschedulable: needs {job.req.describe()}, host too small"
                 self._emit_job(job)
                 continue
-            if self.pool.can_fit_now(job.req):
-                self._launch(job)
-            # else: fits eventually but resources are busy — leave queued.
+            ready.append(job)                              # deps satisfied; host can fit it eventually
+
+        # Launch ready jobs that fit right now, one at a time, re-evaluating after each. Tie-break so
+        # the set of concurrently-running jobs stays as homogeneous as possible: prefer a job whose
+        # type already has a sibling running; otherwise walk the dependency graph breadth-first
+        # (shallower stages first), then declaration order. A freshly started type becomes "running",
+        # so its siblings are picked next.
+        while True:
+            fits = [j for j in ready if j.state == "queued" and self.pool.can_fit_now(j.req)]
+            if not fits:
+                break
+            active = self._running_types()
+            fits.sort(key=lambda j: (0 if self._type_of(j) in active else 1,
+                                     self._level.get(j.relpath, 0)))
+            self._launch(fits[0])
+
+    @staticmethod
+    def _type_of(job: Job) -> str:
+        return type(job.artifact).__name__
+
+    def _running_types(self) -> set:
+        """Artifact types with a job currently running (or yielding)."""
+        return {self._type_of(j) for j in self.order if j.state in ("running", "yielding")}
+
+    def _compute_levels(self) -> dict:
+        """Breadth-first depth per job over this run's dependency graph: 0 for a job with no in-run
+        dependency, else one past its deepest in-run dependency. Jobs at the same depth are usually
+        the same pipeline step, so depth order keeps concurrently-running work homogeneous."""
+        level: dict[str, int] = {}
+
+        def depth(relpath: str) -> int:
+            if relpath in level:
+                return level[relpath]
+            level[relpath] = 0                             # tentative (the graph is a DAG)
+            job = self.jobs.get(relpath)
+            deps = [d for d in (job.deps if job else []) if d in self.jobs]
+            level[relpath] = 1 + max((depth(d) for d in deps), default=-1)
+            return level[relpath]
+
+        for relpath in self.jobs:
+            depth(relpath)
+        return level
 
     def _launch(self, job: Job) -> None:
         job.assignment = self.pool.acquire(job.req)
@@ -351,8 +400,7 @@ class RunServer:
     # Eventing / broadcast
     # ------------------------------------------------------------------ #
     def emit(self, type: str, **fields) -> None:
-        record = self.eventlog.emit(type, **fields)
-        self._broadcast(record)
+        self.reporter.emit(type, **fields)             # local events.log + broadcast (via on_record)
 
     def _emit_job(self, job: Job) -> None:
         self.emit("job_state", **job.snapshot())
@@ -464,8 +512,8 @@ class RunServer:
             self._sock.close()
         except OSError:
             pass
-        self.eventlog.close()
-        registry.remove(self.port)
+        self.reporter.close(ok=ok, counts=counts)      # final flush + remote `done` if shipping
+        registry.remove(self.port)                     # local attach hint; remote entry persists
         return ok
 
 

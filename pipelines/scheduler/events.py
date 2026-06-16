@@ -10,9 +10,10 @@ Event ``type`` values (and their salient fields):
 * ``server_start``  — ``port``, ``logdir``, ``pool`` (resource snapshot), ``n_jobs``, ``jobs``
                        (the relpaths), the run identity ``project`` / ``store`` / ``base_path``,
                        and ``plan`` (the full topological plan: every artifact's ``relpath`` /
-                       ``cls`` / in-plan ``deps`` / ``cached`` flag). So the log is self-describing
-                       for tools that replay it after the run ends — including which artifacts the
-                       run skipped because they were already committed.
+                       ``cls`` / in-plan ``deps`` / ``cached`` / ``skipped`` flags). So the log is
+                       self-describing for tools that replay it after the run ends — including which
+                       artifacts the run skipped because they were already committed (``cached``) or
+                       were unneeded transients with no running consumer (``skipped``).
 * ``job_state``     — ``relpath``, ``state``, plus whatever changed (``gpus``, ``pid``,
                        ``exit_code``, ``reason``)
 * ``pool``          — current :meth:`ResourcePool.snapshot`

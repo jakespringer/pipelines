@@ -35,13 +35,21 @@ class ArtifactSettings:
     session: Type | None = None
     retries: int = 0
     env: dict | None = None
+    transient: bool = False
 
 
 def artifact(cls=None, /, *, automaterialize: bool = True, autocommit: bool = True,
-             cache: bool = True, store=None, session=None, retries: int = 0, env=None):
-    """Class decorator. Use bare (``@artifact``) or with args (``@artifact(cache=False)``)."""
+             cache: bool = True, store=None, session=None, retries: int = 0, env=None,
+             transient: bool = False):
+    """Class decorator. Use bare (``@artifact``) or with args (``@artifact(cache=False)``).
+
+    ``transient=True`` marks an on-demand intermediate: it is scheduled only when some
+    artifact that will actually run this invocation depends on it. If nothing running
+    needs it, it is skipped even when missing — unless ``--force`` is given. See the
+    freshness/pruning pass in ``execution/graph.py`` and ``docs/06-execution.md`` §2.
+    """
     settings = ArtifactSettings(automaterialize, autocommit, cache, store, session,
-                                retries, env)
+                                retries, env, transient)
 
     def wrap(klass):
         return _build_artifact(klass, settings)
@@ -121,7 +129,7 @@ def _path(self) -> Path:
         raise runtime.RuntimeContextError(
             f"self.path requires an active executor (relpath={self.relpath!r})")
     return validate_under_base(cur.base_path / validate_relpath(self.relpath),
-                               cur.base_path)
+                               cur.base_path, follow_symlinks=False)
 
 
 def _session(self):

@@ -49,9 +49,20 @@ def validate_relpath(rp: str) -> str:
     return rp
 
 
-def validate_under_base(path: Path, base: Path) -> Path:
-    """Defense in depth: the resolved path must stay under ``base``."""
-    base, path = Path(base).resolve(), Path(path).resolve()
+def validate_under_base(path: Path, base: Path, *, follow_symlinks: bool = True) -> Path:
+    """Defense in depth: the path must stay under ``base``.
+
+    By default symlinks are resolved before the check (strict — e.g. the dashboard
+    serving job logs, where a symlink escape would be an attack). Pass
+    ``follow_symlinks=False`` to validate *lexically*: the ``link://`` store
+    materializes an artifact as a symlink that legitimately points to its
+    model-store root outside ``base``, and ``validate_relpath`` already rules out
+    ``..``/absolute escapes, so the lexical check stays safe.
+    """
+    if follow_symlinks:
+        base, path = Path(base).resolve(), Path(path).resolve()
+    else:
+        base, path = Path(os.path.abspath(base)), Path(os.path.abspath(path))
     if os.path.commonpath([str(base), str(path)]) != str(base):
         raise RelpathError(f"path {path} escapes base {base}")
     return path

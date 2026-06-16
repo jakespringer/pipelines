@@ -17,8 +17,8 @@ from pathlib import Path
 from .execution.graph import collect
 
 # Options that take no value (everything else of the form ``--k v`` consumes ``v``).
-_FLAG_OPTS = {"force", "force-all", "dry", "expand", "nofresh",
-              "color", "no-color", "dark", "light"}
+_FLAG_OPTS = {"force", "force-all", "dry", "expand", "nofresh", "skip-committed",
+              "detach", "watch", "color", "no-color", "dark", "light"}
 
 # A ``run.py`` calls ``cli(...)`` without ``sys.exit``-ing its result, so the verb's exit
 # code would otherwise be lost (every worker subprocess would look successful). ``cli``
@@ -68,39 +68,107 @@ def _dispatch(groups: dict[str, list], executor, argv: list[str] | None = None) 
     if verb in ("help", "-h", "--help"):
         return _usage(groups)
 
-    positionals, opts, flags = _parse(rest)
-
-    # `attach` connects to a running server; it needs neither targets nor the executor.
-    if verb == "attach":
-        from .scheduler.tui import attach_main
-        return attach_main(positionals)
-
-    # `dashboard` serves a web monitor for every run; like `attach`, no targets/executor.
+    # `dashboard` serves a web monitor for every run; it needs no targets/executor.
     if verb == "dashboard":
         from .dashboard.server import dashboard_main
         return dashboard_main(rest)
 
-    # Hidden worker verb: build exactly one artifact (used by ParallelExecutor subprocesses).
+    # Hidden worker verb: build exactly one artifact (used by Parallel/Slurm executor jobs).
     if verb == "_worker":
-        return _run_worker(groups, opts)
+        _, opts, flags = _parse(rest)
+        return _run_worker(groups, opts, flags)
 
+    # Backend command groups: `pipelines <backend> <subcommand> ...`.
+    if verb == "slurm":
+        from .execution.executors.slurm_cli import main as slurm_main
+        return slurm_main(groups, executor, rest)
+    if verb == "parallel":
+        return _parallel_group(groups, executor, rest)
+    if verb == "local":
+        return _local_group(groups, executor, rest)
+
+    # Deprecated flat aliases (one release): the old top-level verbs map onto the new groups.
+    if verb == "runparallel":
+        _deprecated("runparallel", "parallel run")
+        return _parallel_group(groups, executor, ["run", *rest])
+    if verb == "attach":
+        _deprecated("attach", "parallel attach")
+        return _parallel_group(groups, executor, ["attach", *rest])
+
+    # Top-level project verbs over the configured executor / graph.
+    positionals, opts, flags = _parse(rest)
+    if verb in ("run", "dryrun", "plan"):
+        targets = _resolve(groups, positionals)
+        if not targets:
+            print(f"no targets matched {positionals or ['(none)']}", file=sys.stderr)
+            return 2
+        if verb == "plan":
+            return _run_plan(executor, targets, flags)
+        if verb == "dryrun":
+            return executor.dryrun(targets)
+        return executor.run(targets, force="force" in flags, force_all="force-all" in flags)
+
+    print(f"unknown command {verb!r} (have verbs: run, dryrun, plan, dashboard; "
+          f"backends: local, parallel, slurm)", file=sys.stderr)
+    return 2
+
+
+def _parallel_group(groups: dict[str, list], executor, argv: list[str]) -> int:
+    """`pipelines parallel <run|attach>` — local resource-aware execution and its live monitor."""
+    if not argv:
+        print("usage: pipelines parallel <run|attach> [...]", file=sys.stderr)
+        return 2
+    sub, rest = argv[0], argv[1:]
+    positionals, opts, flags = _parse(rest)
+    if sub == "attach":                          # connects to a running run server; no targets
+        from .scheduler.tui import attach_main
+        return attach_main(positionals)
+    if sub == "run":
+        targets = _resolve(groups, positionals)
+        if not targets:
+            print(f"no targets matched {positionals or ['(none)']}", file=sys.stderr)
+            return 2
+        return _run_parallel(executor, targets, opts, flags)
+    print(f"unknown parallel subcommand {sub!r} (have: run, attach)", file=sys.stderr)
+    return 2
+
+
+def _local_group(groups: dict[str, list], executor, argv: list[str]) -> int:
+    """`pipelines local run` — sequential, in-process materialization (debug-friendly)."""
+    if not argv:
+        print("usage: pipelines local run [SELECTOR ...] [--force]", file=sys.stderr)
+        return 2
+    sub, rest = argv[0], argv[1:]
+    if sub not in ("run", "dryrun"):
+        print(f"unknown local subcommand {sub!r} (have: run, dryrun)", file=sys.stderr)
+        return 2
+    positionals, opts, flags = _parse(rest)
     targets = _resolve(groups, positionals)
     if not targets:
         print(f"no targets matched {positionals or ['(none)']}", file=sys.stderr)
         return 2
-    force = "force" in flags or "force-all" in flags
+    lx = _local_executor(executor)
+    if sub == "dryrun":
+        return lx.dryrun(targets)
+    return lx.run(targets, force="force" in flags, force_all="force-all" in flags)
 
-    if verb == "run":
-        return executor.run(targets, force=force)
-    if verb == "dryrun":
-        return executor.dryrun(targets)
-    if verb == "runparallel":
-        return _run_parallel(executor, targets, opts, flags, force)
-    if verb == "plan":
-        return _run_plan(executor, targets, flags)
-    print(f"unknown command {verb!r} "
-          f"(have: run, dryrun, runparallel, plan, attach, dashboard)", file=sys.stderr)
-    return 2
+
+def _local_executor(executor):
+    """The configured executor if it is a LocalExecutor, else one built from its store/base_path."""
+    from .execution.executors.local import LocalExecutor
+    if isinstance(executor, LocalExecutor):
+        return executor
+    store = getattr(executor, "store", None)
+    base_path = getattr(executor, "base_path", None)
+    if not store or base_path is None:
+        raise SystemExit("local run needs a store and base_path from the configured executor.")
+    return LocalExecutor(store=store, base_path=base_path,
+                         conda_env=getattr(executor, "conda_env", None),
+                         python_bin=getattr(executor, "python_bin", None))
+
+
+def _deprecated(old: str, new: str) -> None:
+    print(f"pipelines: `{old}` is deprecated; use `{new}`", file=sys.stderr)
 
 
 def _run_plan(executor, targets, flags: set) -> int:
@@ -166,7 +234,7 @@ def _as_path(base_path):
     return Path(str(base_path).replace("file://", "")) if base_path else Path.cwd()
 
 
-def _run_parallel(executor, targets, opts: dict, flags: set, force: bool) -> int:
+def _run_parallel(executor, targets, opts: dict, flags: set) -> int:
     """Build a ParallelExecutor from the configured executor's store/base_path + CLI opts."""
     from .execution.executors.parallel import ParallelExecutor
     from .scheduler.resources import parse_memory_mb
@@ -181,15 +249,23 @@ def _run_parallel(executor, targets, opts: dict, flags: set, force: bool) -> int
         cpus=_int(opts.get("cpus")),
         memory_mb=parse_memory_mb(opts["memory"]) if opts.get("memory") else None,
     )
-    return pexec.run(targets, force=force, dry="dry" in flags)
+    return pexec.run(targets, force="force" in flags, force_all="force-all" in flags,
+                     dry="dry" in flags)
 
 
-def _run_worker(groups: dict[str, list], opts: dict) -> int:
-    """Materialize a single artifact in strict mode (one ParallelExecutor job)."""
+def _run_worker(groups: dict[str, list], opts: dict, flags: set | None = None) -> int:
+    """Materialize a single artifact in strict mode (one Parallel/Slurm executor job).
+
+    ``--skip-committed`` runs the primitive with ``scheduler=True`` so an already-committed output
+    is skipped instead of rebuilt — what a requeued/preempted Slurm task wants. The parallel
+    scheduler never resubmits a committed job, so it leaves the flag off.
+    """
     import logging
     import os
     import traceback
     from pathlib import Path
+
+    flags = flags or set()
 
     from . import runtime
     from .execution.materialize import materialize
@@ -231,7 +307,7 @@ def _run_worker(groups: dict[str, list], opts: dict) -> int:
     try:
         session = _open_session(artifact, rc)
         rc.session = session
-        materialize(artifact, scheduler=False, strict=True)
+        materialize(artifact, scheduler="skip-committed" in flags, strict=True)
         return 0
     except Exception:
         traceback.print_exc()
@@ -281,11 +357,16 @@ def _universe(groups: dict[str, list]) -> dict:
 
 
 def _usage(groups: dict[str, list]) -> int:
-    print("usage: <run|dryrun|plan|runparallel|attach|dashboard> [SELECTOR ...]")
+    print("usage: pipelines <verb|backend> ... [SELECTOR ...]")
+    print("verbs (configured executor / graph):")
+    print("  run|dryrun [SEL...] [--force]   build with the executor configured in run.py")
     print("  plan [SEL...] [--expand] [--nofresh] [--light|--dark] [--no-color]")
-    print("  runparallel [SEL...] [--gpus N --cpus N --memory 64G] [--force] [--dry]")
-    print("  attach [PORT]            monitor a running parallel run (tmux-style TUI)")
-    print("  dashboard [--port 7000]  serve a web monitor for all runs (live + past)")
+    print("  dashboard [--port 7000]         web monitor for all runs (live + past)")
+    print("backends:")
+    print("  local run [SEL...] [--force]                       sequential, in-process")
+    print("  parallel run [SEL...] [--gpus/--cpus/--memory N] [--force] [--dry]   local, parallel")
+    print("  parallel attach [PORT]                             tmux-style live monitor")
+    print("  slurm run|ls|cancel|sendcommand|attach|logs ...    cluster (see `slurm help`)")
     print("groups:", ", ".join(sorted(groups)) or "(none)")
     return 0
 
@@ -348,17 +429,23 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     project, rest = _split_project_flag(argv)
 
-    # `attach` is project-independent: it just connects to a running server. Handle it
-    # directly so it works from anywhere (no run.py / pipelines.toml required).
-    if rest and rest[0] == "attach":
-        from .scheduler.tui import attach_main
-        return attach_main([a for a in rest[1:] if not a.startswith("-")])
-
-    # `dashboard` is likewise project-independent: it watches the registry directory and
-    # serves a web monitor for every run. Its own flags (--port/--host) pass through verbatim.
+    # `dashboard` is project-independent: it watches the registry directory and serves a web
+    # monitor for every run. Its own flags (--port/--host) pass through verbatim.
     if rest and rest[0] == "dashboard":
         from .dashboard.server import dashboard_main
         return dashboard_main(rest[1:])
+
+    # `parallel attach` (and the deprecated bare `attach`) just connects to a running run server,
+    # so handle it before discovering a run.py — it works from anywhere.
+    attach_args = None
+    if rest and rest[0] == "attach":
+        _deprecated("attach", "parallel attach")
+        attach_args = rest[1:]
+    elif rest[:2] == ["parallel", "attach"]:
+        attach_args = rest[2:]
+    if attach_args is not None:
+        from .scheduler.tui import attach_main
+        return attach_main([a for a in attach_args if not a.startswith("-")])
 
     run_file = _discover_run_file(project)
     project_dir = run_file.parent
@@ -374,6 +461,14 @@ def main(argv: list[str] | None = None) -> int:
     sys.argv = [str(run_file), *rest]
     global LAST_EXIT_CODE
     LAST_EXIT_CODE = 0
-    runpy.run_module(f"{_SYNTH_PKG}.run", run_name="__main__", alter_sys=True)
+    # alter_sys=False: keep sys.modules["__main__"] as the real, import-guarded
+    # ``pipelines.__main__`` rather than the synthetic ``_pipelines_project.run``.
+    # In-process libraries that spawn workers (vLLM tensor-parallel forces the
+    # 'spawn' start method under CUDA) re-import the parent's __main__ in each child;
+    # a fresh interpreter cannot import the synthetic package and dies with
+    # ModuleNotFoundError('_pipelines_project'). The real __main__ is guarded, so
+    # re-importing it in a child is a harmless no-op, while run.py still runs as
+    # __main__ and its relative imports still resolve via the registered package.
+    runpy.run_module(f"{_SYNTH_PKG}.run", run_name="__main__", alter_sys=False)
     # run.py's ``cli(...)`` recorded the verb's exit code; propagate it as the process status.
     return LAST_EXIT_CODE

@@ -97,6 +97,8 @@ class _Graph:
         self.ink = ink
         self.arts = list(plan.ordered)
         self.satisfied = {id(a) for a in plan.satisfied}
+        # Transient artifacts pruned because nothing that will run depends on them.
+        self.skipped = {id(a) for a in getattr(plan, "transient_skipped", ())}
         self.universe = {a.relpath: a for a in self.arts}
         self.cls = {a.relpath: type(a).__name__ for a in self.arts}
 
@@ -236,15 +238,25 @@ class _Graph:
         ink = self.ink
         arts = self.by_node[n]
         total = len(arts)
-        skip = sum(1 for a in arts if id(a) in self.satisfied)
-        build = total - skip
-        if skip == 0:
+        committed = sum(1 for a in arts if id(a) in self.satisfied)
+        skipped = sum(1 for a in arts if id(a) in self.skipped)
+        build = total - committed - skipped
+        if committed == total:
+            return ink("committed", ink.MUTED)
+        if skipped == total:
+            return ink("transient (skipped)", ink.MUTED)
+        if build == total:
             word, color = ("fetch", ink.FETCH) if self._external(n) else ("build", ink.BUILD)
             return ink(word, color)
-        if build == 0:
-            return ink("committed", ink.MUTED)
-        return (f"{ink(str(build) + ' build', ink.BUILD)} {ink('·', ink.MUTED)} "
-                f"{ink(str(skip) + ' committed', ink.MUTED)}")
+        parts = []
+        if build:
+            word = "fetch" if self._external(n) else "build"
+            parts.append(ink(f"{build} {word}", ink.BUILD))
+        if committed:
+            parts.append(ink(f"{committed} committed", ink.MUTED))
+        if skipped:
+            parts.append(ink(f"{skipped} transient", ink.MUTED))
+        return ink(" · ", ink.MUTED).join(parts)
 
     def _names_join(self, nodes) -> str:
         ink = self.ink
@@ -361,7 +373,7 @@ def _expand_instances(g: _Graph, n: str, prefix: str, out: list, limit: int = 6)
     ink = g.ink
     arts = sorted(g.by_node[n], key=lambda a: a.relpath)
     for a in arts[:limit]:
-        mark = "·" if id(a) in g.satisfied else "▸"
+        mark = "·" if id(a) in g.satisfied else "⊘" if id(a) in g.skipped else "▸"
         out.append(prefix + ink(f"{mark} {a.relpath}", ink.FAINT))
     if len(arts) > limit:
         out.append(prefix + ink(f"  … (+{len(arts) - limit} more)", ink.FAINT))
@@ -373,14 +385,19 @@ def _expand_instances(g: _Graph, n: str, prefix: str, out: list, limit: int = 6)
 
 def _header(g: _Graph, width: int, ink: _Ink) -> str:
     n = len(g.arts)
-    skip = len(g.satisfied)
-    build = n - skip
+    committed = len(g.satisfied)
+    skipped = len(g.skipped)
+    build = n - committed - skipped
     classes = len(set(g.cls.values()))
-    gpu = sum(_req(a.annotations)[0] for a in g.arts if id(a) not in g.satisfied)
+    gpu = sum(_req(a.annotations)[0] for a in g.arts
+              if id(a) not in g.satisfied and id(a) not in g.skipped)
     title = "pipelines plan"
     nodes_note = f" ({len(g.nodes)} nodes)" if len(g.nodes) != classes else ""
     s1 = f"{n} artifacts · {classes} types{nodes_note}"
-    s2 = f"{build} to build · {skip} committed · {gpu} GPU-slots"
+    s2 = f"{build} to build · {committed} committed"
+    if skipped:
+        s2 += f" · {skipped} transient skipped"
+    s2 += f" · {gpu} GPU-slots"
     inner = max(len(title) + 1, len(s1), len(s2))
     inner = min(inner, max(len(title) + 1, width - 4))
     top = (ink("╭─ ", ink.MUTED) + ink(title, ink.BOLD)
@@ -394,7 +411,7 @@ def _footer(g: _Graph, ink: _Ink) -> str:
     rows = []
     for nd in sorted(g.nodes, key=lambda n: (-g.tier[n], g.disp(n))):
         arts = g.by_node[nd]
-        build = sum(1 for a in arts if id(a) not in g.satisfied)
+        build = sum(1 for a in arts if id(a) not in g.satisfied and id(a) not in g.skipped)
         rows.append((g.disp(nd), len(arts), build, g._color(nd)))
     wt = max((len(r[0]) for r in rows), default=4)
     lines = [ink("summary  (downstream → upstream)", ink.BOLD)]

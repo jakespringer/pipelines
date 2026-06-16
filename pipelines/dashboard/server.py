@@ -1,19 +1,26 @@
-"""``pipelines dashboard`` — a small, dependency-free web monitor for parallel runs.
+"""``pipelines dashboard`` — a small, dependency-free local web monitor for remote runs.
 
 A :class:`~http.server.ThreadingHTTPServer` serves a single-page UI plus a JSON/SSE API backed by
 :class:`pipelines.dashboard.index.RunIndex`. It needs no project, no run server connection, and no
-third-party packages — it just watches the registry directory, so newly launched ``runparallel``
-servers (one or many) show up on their own within a poll, and finished runs stay browsable.
+third-party packages — it just watches the registry directory. Runs ship their ``events.log`` here
+over SSH (see :mod:`pipelines.reporting`), so a run on any machine shows up on its own within a poll,
+and finished runs stay browsable. The dashboard is a pure viewer: SSH (not an HTTP port) is the only
+ingress for run data, so it stays bound to localhost for the browser.
 
 Routes
 ------
 ``GET /``                                   the dashboard page (static assets)
-``GET /api/runs``                           JSON list of every run + summary
-``GET /api/overview``                       JSON every run's full detail (the expanded view)
-``GET /api/runs/<port>``                    JSON detail of one run, grouped into pipeline steps
-``GET /api/runs/<port>/stream``             SSE: a snapshot, then live event records
-``GET /api/runs/<port>/log/<slug>``         a job's full log as text/plain
-``GET /api/runs/<port>/log/<slug>/stream``  SSE: the log, then live-tailed appends
+``GET /api/runs``                            JSON list of every run + summary
+``GET /api/overview``                        JSON every run's full detail (the expanded view)
+``GET /api/runs/<run_id>``                   JSON detail of one run, grouped into pipeline steps
+``GET /api/runs/<run_id>/stream``            SSE: a snapshot, then live event records
+``GET /api/runs/<run_id>/log/<slug>``        a job's full log as text/plain
+``GET /api/runs/<run_id>/log/<slug>/stream`` SSE: the log, then live-tailed appends
+``GET /api/system/nodes``                    JSON the nodes we sample + their latest readings
+``GET /api/system/<node>``                   JSON a node's GPU/CPU/memory time-series (?window, ?since_ts)
+
+A ``<run_id>`` is an opaque string — a TCP ``port`` for a ``runparallel`` run, or a ``slurm-…`` id
+for a ``SlurmExecutor`` run; the read path is agnostic to which.
 
 Live data uses Server-Sent Events. Every SSE payload is a JSON value (so log text with arbitrary
 newlines never collides with SSE's line framing). Each long-lived stream runs on its own thread and
@@ -26,6 +33,7 @@ the read path here is deliberately decoupled from that so the monitor keeps work
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import webbrowser
@@ -36,6 +44,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from ..identity import validate_under_base
 from ..scheduler import registry
 from .index import RunIndex, RunView
+from .metrics import MetricsStore
 
 ASSETS = Path(__file__).parent / "assets"
 
@@ -51,6 +60,18 @@ _CONTENT_TYPES = {
     ".svg": "image/svg+xml",
 }
 
+# We never let the browser cache anything we serve: a dashboard is pure live state, and a
+# stale ``app.js`` against a newer ``index.html`` renders a blank page (the symptom that
+# prompted this — it only bit non-incognito tabs, which carry a warm cache). ``no-cache``
+# alone permits storage and revalidation, which browsers don't always honour without a
+# validator; ``no-store`` forbids keeping a copy at all. ``Pragma``/``Expires`` cover
+# ancient intermediaries.
+_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
 
 class _DashboardHandler(BaseHTTPRequestHandler):
     server_version = "pipelines-dashboard"
@@ -60,6 +81,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
     @property
     def _index(self) -> RunIndex:
         return self.server.run_index           # set in _make_server
+
+    @property
+    def _system(self) -> MetricsStore:
+        return self.server.system              # set in _make_server
 
     def log_message(self, *args) -> None:      # keep the console to our own startup lines
         pass
@@ -86,21 +111,38 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/overview":
             return self._json(self._index.overview_payload())
 
+        if path == "/api/system/nodes":
+            live_by_node: dict[str, int] = {}      # count live runs per reporting node
+            for info in registry.list_runs(only_alive=True):
+                node = info.get("node")
+                if node:
+                    live_by_node[node] = live_by_node.get(node, 0) + 1
+            return self._json(self._system.nodes(live_runs_by_node=live_by_node))
+        if path.startswith("/api/system/"):
+            node = path[len("/api/system/"):]
+            if node and "/" not in node:
+                query = parse_qs(parsed.query)
+                payload = self._system.series(
+                    node,
+                    window=_float(_first(query, "window"), 3600.0),
+                    since_ts=_float(_first(query, "since_ts"), None))
+                return self._json(payload) if payload is not None else self._not_found()
+
         parts = [p for p in path.split("/") if p]
-        if len(parts) >= 3 and parts[:2] == ["api", "runs"] and parts[2].isdigit():
-            port, rest = int(parts[2]), parts[3:]
+        if len(parts) >= 3 and parts[:2] == ["api", "runs"] and _safe_run_id(parts[2]):
+            run_id, rest = parts[2], parts[3:]     # opaque string id (a port for parallel runs)
             if not rest:
-                payload = self._index.detail_payload(port)
+                payload = self._index.detail_payload(run_id)
                 return self._json(payload) if payload else self._not_found()
             if rest == ["stream"]:
-                return self._stream_run(port)
+                return self._stream_run(run_id)
             if rest[0] == "log" and len(rest) >= 2:
                 slug = rest[1]
                 if rest[2:] == ["stream"]:
-                    return self._stream_log(port, slug)
+                    return self._stream_log(run_id, slug)
                 if len(rest) == 2:
                     query = parse_qs(parsed.query)
-                    return self._serve_log(port, slug, download="download" in query)
+                    return self._serve_log(run_id, slug, download="download" in query)
         self._not_found()
 
     # -- finite responses --------------------------------------------------- #
@@ -115,7 +157,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _json(self, obj, code: int = 200) -> None:
-        self._reply(json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8", code)
+        self._reply(json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8", code,
+                    extra=_NO_CACHE_HEADERS)
 
     def _asset(self, name: str) -> None:
         path = ASSETS / name
@@ -124,24 +167,28 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             body = path.read_bytes()
         except OSError:
             return self._not_found()
-        self._reply(body, ctype, extra={"Cache-Control": "no-cache"})
+        if name == "index.html":
+            body = _stamp_index(body)          # version the JS/CSS refs so stale copies can't load
+        self._reply(body, ctype, extra=_NO_CACHE_HEADERS)
 
     def _not_found(self) -> None:
         self._reply(b"not found", "text/plain; charset=utf-8", code=404)
 
-    def _serve_log(self, port: int, slug: str, *, download: bool) -> None:
-        path = self._log_path(port, slug)
+    def _serve_log(self, run_id: str, slug: str, *, download: bool) -> None:
+        path = self._log_path(run_id, slug)
         if path is None:
             return self._not_found()
         try:
             body = path.read_bytes()
         except OSError:
             body = b""
-        extra = {"Content-Disposition": f'attachment; filename="{slug}.log"'} if download else None
+        extra = dict(_NO_CACHE_HEADERS)
+        if download:
+            extra["Content-Disposition"] = f'attachment; filename="{slug}.log"'
         self._reply(body, "text/plain; charset=utf-8", extra=extra)
 
-    def _log_path(self, port: int, slug: str) -> Path | None:
-        logdir = self._index.logdir_for(port)
+    def _log_path(self, run_id: str, slug: str) -> Path | None:
+        logdir = self._index.logdir_for(run_id)
         if logdir is None or "/" in slug or slug in ("", ".", ".."):
             return None
         jobs_dir = Path(logdir) / "jobs"
@@ -178,15 +225,15 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         return self._sse(": keepalive\n\n")
 
     # -- run stream --------------------------------------------------------- #
-    def _stream_run(self, port: int) -> None:
-        logdir = self._index.logdir_for(port)
+    def _stream_run(self, run_id: str) -> None:
+        logdir = self._index.logdir_for(run_id)
         if logdir is None:
             return self._not_found()
         self._sse_open()
-        view = RunView(port, logdir)
+        view = RunView(run_id, logdir)
         view.refresh()
-        live = registry.port_alive(port)
-        info = self._index.registry_info(port)
+        live = self._index.is_live(run_id)
+        info = self._index.registry_info(run_id)
         if not self._emit(self._index.detail_from_view(view, live, info), event="snapshot"):
             return
         quiet = time.monotonic()
@@ -197,7 +244,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     return
             if records:
                 quiet = time.monotonic()
-            live = False if view.done else registry.port_alive(port)
+            live = False if view.done else self._index.is_live(run_id)
             if view.done or not live:
                 self._emit({"done": view.done, "ok": view.ok}, event="end")
                 return
@@ -208,8 +255,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             time.sleep(_POLL)
 
     # -- log stream --------------------------------------------------------- #
-    def _stream_log(self, port: int, slug: str) -> None:
-        path = self._log_path(port, slug)
+    def _stream_log(self, run_id: str, slug: str) -> None:
+        path = self._log_path(run_id, slug)
         if path is None:
             return self._not_found()
         self._sse_open()
@@ -237,7 +284,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                         return
                     quiet = time.monotonic()
                     continue                           # there may be more buffered; read again
-            if not registry.port_alive(port):          # run finished and we are caught up
+            if not self._index.is_live(run_id):         # run finished and we are caught up
                 self._emit({}, event="end")
                 return
             if time.monotonic() - quiet > _HEARTBEAT:
@@ -261,6 +308,7 @@ def _make_server(host: str, port: int) -> ThreadingHTTPServer:
             continue
         httpd.daemon_threads = True
         httpd.run_index = RunIndex()
+        httpd.system = MetricsStore()          # viewer: reads <node>.jsonl files; no sampler thread
         return httpd
     raise SystemExit(f"pipelines dashboard: no free port in [{port}, {port + 50}): {last}")
 
@@ -284,6 +332,7 @@ def serve(host: str = "127.0.0.1", port: int = 7000, *, open_browser: bool = Fal
     except KeyboardInterrupt:
         print("\npipelines dashboard: stopped")
     finally:
+        getattr(httpd, "system", None) and httpd.system.stop()
         httpd.shutdown()
         httpd.server_close()
     return 0
@@ -317,3 +366,48 @@ def _int(value: str, fallback: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _float(value, fallback):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _first(query: dict, key: str):
+    """First value for ``key`` in a ``parse_qs`` mapping, or ``None``."""
+    vals = query.get(key)
+    return vals[0] if vals else None
+
+
+def _safe_run_id(seg: str) -> bool:
+    """A path segment usable as a run id: non-empty, no separators, not a traversal."""
+    return bool(seg) and "/" not in seg and seg not in (".", "..")
+
+
+def _asset_token() -> str:
+    """A short content hash of the front-end assets, used to cache-bust their URLs."""
+    digest = hashlib.sha1()
+    for name in ("app.js", "style.css"):
+        try:
+            digest.update((ASSETS / name).read_bytes())
+        except OSError:
+            pass
+    return digest.hexdigest()[:12]
+
+
+def _stamp_index(html: bytes) -> bytes:
+    """Append ``?v=<hash>`` to the JS/CSS refs in ``index.html``.
+
+    The bare ``/app.js`` and ``/style.css`` URLs may already sit in a browser's cache from
+    an earlier, cacheable response; ``no-store`` only governs new responses, so it can't
+    evict those. The query string is a URL the browser has never seen, forcing a fresh
+    fetch, and changes whenever the asset bytes do. The server ignores the query (it routes
+    on ``urlsplit().path``), so the stamped URLs resolve normally.
+    """
+    token = _asset_token()
+    text = html.decode("utf-8")
+    text = text.replace('href="/style.css"', f'href="/style.css?v={token}"')
+    text = text.replace('src="/app.js"', f'src="/app.js?v={token}"')
+    return text.encode("utf-8")

@@ -1,15 +1,17 @@
 """Run discovery and event-log replay for the dashboard.
 
 The dashboard never talks to a run server over its socket. Instead it reads the same
-append-only ``events.log`` that every parallel run writes (see :mod:`pipelines.scheduler.events`).
-That file is the complete, replayable record of a run, so one code path serves a *live* run and a
-*finished* one identically — and the dashboard keeps working after a run (or the dashboard itself)
-has exited.
+append-only ``events.log`` that every run writes (see :mod:`pipelines.scheduler.events`) — for a
+remote run, the copy ``rsync``'d into ``<registry_dir>/<run_id>/`` over SSH (see
+:mod:`pipelines.reporting`). That file is the complete, replayable record of a run, so one code path
+serves a *live* run and a *finished* one identically — and the dashboard keeps working after a run
+(or the dashboard itself) has exited.
 
 * :class:`RunView` replays one run's ``events.log`` into a queryable state, incrementally: each
   :meth:`RunView.refresh` reads only the bytes appended since the last call and returns the new
   records, so a streaming endpoint can forward them verbatim. It tracks *every* artifact in the
-  run's plan — the ones it built and the ones it skipped as already committed (``cached``).
+  run's plan — the ones it built, the ones it skipped as already committed (``cached``), and
+  unneeded transients pruned because nothing running depended on them (``skipped``).
 * :class:`RunIndex` discovers every run under the registry directory, keeps a cache of views, and
   renders the JSON payloads. The detail payload is grouped **by pipeline step** (artifact type,
   ordered by depth) to mirror ``pipelines plan``.
@@ -25,9 +27,10 @@ from pathlib import Path
 from ..identity import slug as _slug
 from ..scheduler import registry
 
-# Display ordering for states — active work first, then done (completed/cached), then failures.
+# Display ordering for states — active work first, then done (completed/cached/skipped),
+# then failures. "skipped" is a transient artifact pruned because nothing running needed it.
 STATE_ORDER = ["running", "yielding", "queued", "held", "blocked",
-               "completed", "cached", "failed", "cancelled"]
+               "completed", "cached", "skipped", "failed", "cancelled"]
 
 
 class RunView:
@@ -37,8 +40,9 @@ class RunView:
     instance and refreshes it from its own thread.
     """
 
-    def __init__(self, port: int, logdir):
-        self.port = int(port)
+    def __init__(self, run_id, logdir):
+        self.run_id = str(run_id)
+        self.port = self.run_id        # back-compat alias: payloads still expose this as "port"
         self.logdir = Path(logdir)
         self.events_path = self.logdir / "events.log"
         self._offset = 0          # bytes of events.log already consumed
@@ -152,6 +156,7 @@ class RunView:
         if not relpath:
             return
         cached = bool(entry.get("cached"))
+        skipped = bool(entry.get("skipped"))      # transient pruned: no running consumer
         if relpath not in self.arts:
             self.order.append(relpath)
         self.arts[relpath] = {                    # fresh: server_start reset cleared any prior state
@@ -159,7 +164,8 @@ class RunView:
             "cls": entry.get("cls"),
             "deps": entry.get("deps") or [],
             "cached": cached,
-            "state": "cached" if cached else "queued",
+            "skipped": skipped,
+            "state": "cached" if cached else "skipped" if skipped else "queued",
         }
 
     def _ensure(self, relpath: str) -> None:
@@ -186,70 +192,76 @@ class RunIndex:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._views: dict[int, RunView] = {}
+        self._views: dict[str, RunView] = {}
+        self._announced: set[str] = set()       # run_ids already logged as connected (once each)
 
     # ------------------------------------------------------------------ #
     # Discovery
     # ------------------------------------------------------------------ #
-    def discover(self) -> dict[int, Path]:
-        """Every run we can find as ``{port: logdir}`` (live and historical)."""
+    def discover(self) -> dict[str, Path]:
+        """Every run we can find as ``{run_id: logdir}`` (live and historical).
+
+        One source: each run's ``<run_id>.json`` registry entry. ``registry.logdir_of`` resolves the
+        directory holding ``events.log`` — for a remote run that is ``<registry_dir>/<run_id>/``
+        (rsync'd from the job machine); for a slurm run the shared-filesystem rundir. A run whose
+        ``events.log`` hasn't landed yet (entry written, first rsync pending) is skipped until it does.
+        """
         root = registry.registry_dir()
-        dirs: dict[int, Path] = {}
-        try:
-            for child in root.iterdir():
-                if child.is_dir() and child.name.isdigit() and (child / "events.log").exists():
-                    dirs[int(child.name)] = child
-        except OSError:
-            pass
-        # A live run may keep its log dir elsewhere (custom runs_root); its registry entry records
-        # the real path, so fold those in too.
+        dirs: dict[str, Path] = {}
         try:
             for f in root.glob("*.json"):
                 try:
                     info = json.loads(f.read_text())
                 except (OSError, json.JSONDecodeError):
                     continue
-                port = int(info.get("port", 0) or 0)
-                logdir = info.get("logdir")
-                if port and logdir and (Path(logdir) / "events.log").exists():
-                    dirs.setdefault(port, Path(logdir))
+                run_id = registry.run_id_of(info)
+                logdir = registry.logdir_of(info)
+                if run_id and logdir and (Path(logdir) / "events.log").exists():
+                    dirs[run_id] = Path(logdir)
         except OSError:
             pass
         return dirs
 
-    def _live(self) -> dict[int, dict]:
-        """``{port: registry_info}`` for runs that are currently serving.
+    def _live(self) -> dict[str, dict]:
+        """``{run_id: registry_info}`` for runs that are currently live.
 
-        Reuses :func:`registry.list_runs`, which TCP-checks each registered port and prunes dead
-        entries — so we only ever probe ports that own a registry file (never the full history).
+        Reuses :func:`registry.list_runs`, which liveness-checks each registered run (heartbeat for
+        slurm/remote, TCP probe for a parallel attach hint) and prunes dead parallel hints — so we
+        only ever check runs that own a registry file (never the full history).
         """
-        out: dict[int, dict] = {}
+        out: dict[str, dict] = {}
         for info in registry.list_runs(only_alive=True):
-            try:
-                out[int(info["port"])] = info
-            except (KeyError, TypeError, ValueError):
-                continue
+            run_id = registry.run_id_of(info)
+            if run_id:
+                out[run_id] = info
         return out
 
-    def logdir_for(self, port: int) -> Path | None:
-        return self.discover().get(int(port))
+    def logdir_for(self, run_id) -> Path | None:
+        return self.discover().get(str(run_id))
 
-    def registry_info(self, port: int) -> dict | None:
-        """The registry entry for ``port`` if it still exists (started_at / project / store …)."""
+    def registry_info(self, run_id) -> dict | None:
+        """The registry entry for ``run_id`` if it still exists (started_at / project / store …)."""
         try:
-            return json.loads((registry.registry_dir() / f"{int(port)}.json").read_text())
+            return json.loads((registry.registry_dir() / f"{run_id}.json").read_text())
         except (OSError, json.JSONDecodeError, ValueError):
             return None
+
+    def is_live(self, run_id) -> bool:
+        """Whether ``run_id`` is currently live — kind-aware (heartbeat for slurm/remote, TCP port
+        for a parallel attach hint). Reads only this run's registry entry, cheap for stream polls."""
+        info = self.registry_info(run_id)
+        return registry.alive(info) if info is not None else False
 
     # ------------------------------------------------------------------ #
     # View cache
     # ------------------------------------------------------------------ #
-    def _sync_locked(self, dirs: dict[int, Path]) -> None:
-        """Create/drop/refresh cached views to match ``dirs``. Caller must hold ``_lock``.
+    def _sync_locked(self, dirs: dict[str, Path], live: dict[str, dict]) -> None:
+        """Create/drop/refresh cached views to match ``dirs``, and log newly-connected runs.
 
         Filesystem/TCP discovery happens *before* the lock; only the in-memory view update and
         payload build run under it, so a payload is always read from views no other request is
-        mutating concurrently.
+        mutating concurrently. ``live`` is ``{run_id: registry_info}`` for the currently-live runs
+        (from the caller's :meth:`_live`), used to announce a run the first time it shows up.
         """
         for port in list(self._views):              # forget runs whose dir disappeared
             if port not in dirs:
@@ -260,6 +272,15 @@ class RunIndex:
                 view = RunView(port, logdir)
                 self._views[port] = view
             view.refresh()
+        # Announce each run once, the first time it appears live in the index — i.e. its
+        # events.log has landed (it's in ``dirs``) and it is currently alive. This is a run
+        # "connecting" to the dashboard (a remote job's logs reaching us, or a local run starting).
+        for run_id in dirs:
+            if run_id in live and run_id not in self._announced:
+                self._announced.add(run_id)
+                node = (live.get(run_id) or {}).get("node")
+                where = f" (node {node})" if node else ""
+                print(f"pipelines dashboard: run {run_id} connected{where}", flush=True)
 
     # ------------------------------------------------------------------ #
     # Payloads
@@ -269,7 +290,7 @@ class RunIndex:
         live = self._live()
         now = time.time()
         with self._lock:
-            self._sync_locked(dirs)
+            self._sync_locked(dirs, live)
             runs = [self._summary(v, p in live, live.get(p), now) for p, v in self._views.items()]
         runs.sort(key=lambda r: (not r["live"], -(r["started_at"] or 0)))
         return {"now": now, "runs": runs}
@@ -280,20 +301,20 @@ class RunIndex:
         live = self._live()
         now = time.time()
         with self._lock:
-            self._sync_locked(dirs)
+            self._sync_locked(dirs, live)
             runs = [self._detail(v, p in live, live.get(p), now) for p, v in self._views.items()]
         runs.sort(key=lambda r: (not r["live"], -(r["started_at"] or 0)))
         return {"now": now, "runs": runs}
 
-    def detail_payload(self, port: int) -> dict | None:
-        port = int(port)
+    def detail_payload(self, run_id) -> dict | None:
+        run_id = str(run_id)
         dirs = self.discover()
         live = self._live()
         now = time.time()
         with self._lock:
-            self._sync_locked(dirs)
-            view = self._views.get(port)
-            return self._detail(view, port in live, live.get(port), now) if view else None
+            self._sync_locked(dirs, live)
+            view = self._views.get(run_id)
+            return self._detail(view, run_id in live, live.get(run_id), now) if view else None
 
     def detail_from_view(self, view: RunView, is_live: bool, info: dict | None = None) -> dict:
         """Render a detail payload from a caller-owned view (used by the streaming endpoint).
@@ -318,6 +339,7 @@ class RunIndex:
         elapsed = ((ended if ended is not None else now) - started) if started else None
         return {
             "port": view.port,
+            "node": info.get("node"),                 # the job's host (remote runs); None otherwise
             "project": view.project or info.get("project"),
             "store": view.store or info.get("store"),
             "base_path": view.base_path or info.get("base_path"),
@@ -398,8 +420,10 @@ def _instance(art: dict, name: str, now: float) -> dict:
         "name": name,
         "state": art.get("state", "queued"),
         "cached": bool(art.get("cached")),
+        "skipped": bool(art.get("skipped")),
         "gpus": art.get("gpus", []),
         "pid": art.get("pid"),
+        "job_id": art.get("job_id"),       # slurm job id (parallel runs leave this unset)
         "exit_code": art.get("exit_code"),
         "reason": art.get("reason", ""),
         "held": bool(art.get("held", False)),

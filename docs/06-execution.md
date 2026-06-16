@@ -71,15 +71,45 @@ Given target artifacts:
 4. **`freshness(reachable)`** — one batched pass: group artifacts by **selected Store** (M-5), call
    `store.exists_many([relpaths])` per group; mark committed-and-`cache=True` artifacts *satisfied*,
    prune from the "to build" set but **retain for ordering** (a consumer still `retrieve`s them).
+5. **`_prune_transient(unsatisfied)`** — drop `@artifact(transient=True)` intermediates that no
+   artifact-that-will-run depends on (see *Transient artifacts* below). Like satisfied artifacts,
+   they are **retained for ordering** but moved out of `to_build` into `transient_skipped`.
 
 ```python
 @dataclass
 class Plan:
-    tiers: list[list]          # topological tiers, satisfied artifacts retained for ordering
-    to_build: set              # unsatisfied
-    satisfied: set
-    annotations: dict          # relpath -> resolved annotations (annotations.py)
+    ordered: list              # topological order; satisfied/skipped retained for ordering
+    to_build: set              # will build (excludes satisfied and transient_skipped)
+    satisfied: set             # already committed
+    transient_skipped: set     # transient, no running consumer (kept if a forced artifact needs it)
+    forced: set                # rebuilt unconditionally (--force ⇒ targets, --force-all ⇒ all)
 ```
+
+### Transient artifacts (`@artifact(transient=True)`)
+
+A *transient* artifact is an on-demand intermediate (a large scratch corpus, an ephemeral
+projection) that should materialize **only when something that will actually run this invocation
+consumes it** — not merely because it is missing and reachable. The freshness pass computes the
+"will run" set by closure: seed it with every **non-transient** unsatisfied artifact (those always
+build), then walk *down* dependency edges within the unsatisfied set — each will-run artifact pulls
+in every unsatisfied input it needs (transient or not), transitively. Any transient artifact the
+closure never reaches has **no running consumer** and is moved to `transient_skipped`; it is skipped
+even though it is missing.
+
+This is exactly the "the final result is already committed, so don't rebuild the scratch it was
+derived from" case: if a non-transient consumer `C` is *satisfied*, it does not run, so it never pulls
+its transient upstream `T` into the closure — `T` is skipped. The prune is **safe** precisely because
+a skipped artifact has no running dependent, so no `_ready_dep` (autonomous mode) or scheduler edge
+(parallel mode) ever tries to resurrect it.
+
+`build_plan(targets, force=…, force_all=…)` records which artifacts are forced. `--force` forces
+**only the selected targets** (the group members / glob matches named on the command line) — they are
+dropped from `satisfied` (so they rebuild even if committed) and seed the prune (so any transient they
+need is retained), while their *dependencies* keep normal freshness (a committed input is retrieved,
+not rebuilt). `--force-all` forces the **whole reachable graph**: nothing is treated as satisfied and
+no transient is skipped. Executors read `Plan.forced` to bypass the materialize-time cache check for
+those artifacts (Slurm additionally omits `--skip-committed` for them). The `plan`/`dryrun` output and
+the dashboard surface `transient_skipped` as a distinct *skipped* state, separate from *committed*.
 
 **Ordering is always derived from fields**, independent of `automaterialize` ([01 §6](01-core-artifact.md)
 note): even with `automaterialize=False`, upstreams build first; only local retrieval/resolution is the

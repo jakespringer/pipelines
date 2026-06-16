@@ -141,6 +141,13 @@ can't tell from `squeue` what the project is or what's running. Properties:
 
 (See [09](09-cli-and-observability.md) for how `status` uses this.)
 
+> **Implementation status.** v1 (`pipelines/execution/executors/slurm.py`) emits **one job per
+> artifact**, `afterok`-wired, with the opaque stateless job names above. A foreground/detachable
+> monitor (`pipelines/scheduler/slurm_monitor.py`) polls `squeue`/`sacct` and writes the same
+> `events.log` the dashboard replays. Array jobs (this section's sweep optimization) are the planned
+> next step: the single-job submission loop is the seam they attach to. Driven by the `pipelines
+> slurm` command group ([09](09-cli-and-observability.md) §3).
+
 ---
 
 ## 6. Batching and sessions

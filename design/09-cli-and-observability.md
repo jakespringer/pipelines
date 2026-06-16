@@ -70,12 +70,22 @@ bare `relpath` against its selected Store, since nothing is rebuilt.)
 
 ## 3. Commands
 
+Backend-specific verbs are **namespaced** as `pipelines <backend> <verb>` (mirrored across backends);
+backend-independent verbs stay top-level. (`runparallel`/`attach` remain as deprecated aliases for
+`parallel run`/`parallel attach`.)
+
 | Command | What it does |
 |---------|--------------|
-| `run [SELECTOR…] [--target G] [--force/--force-all] [--head/--tail N] [--executor X]` | Build the selection ([06](06-execution.md)). |
-| `runparallel [SELECTOR…] [--gpus/--cpus/--memory N] [--force] [--dry]` | **(implemented)** Resource-aware local parallel build via the run server; auto-detects host resources unless overridden. |
-| `attach [PORT]` | **(implemented)** tmux-style live monitor for a parallel run (newest live run if `PORT` omitted). |
-| `dashboard [--port 7000] [--host H] [--open]` | **(implemented)** dependency-free web monitor for *all* runs (live and past). Watches the run registry — new `runparallel` servers appear on their own — and replays each run's event log. A run is shown grouped into **pipeline steps** (by artifact type, like `plan`), each expandable to its instances, with already-committed artifacts marked **cached**; an "all runs" tab shows every run expanded inline. Per-job logs are live-tailed over SSE. Project-independent. |
+| `run [SELECTOR…] [--force/--force-all]` | Build the selection with the **configured** executor ([06](06-execution.md)); `dryrun` previews it. |
+| `local run [SELECTOR…] [--force]` | **(implemented)** Sequential, in-process build (`LocalExecutor`) — debug-friendly. |
+| `parallel run [SELECTOR…] [--gpus/--cpus/--memory N] [--force] [--dry]` | **(implemented)** Resource-aware local parallel build via the run server; auto-detects host resources unless overridden. |
+| `parallel attach [PORT]` | **(implemented)** tmux-style live monitor for a parallel run (newest live run if `PORT` omitted). |
+| `slurm run [SELECTOR…] [--force] [--detach] [--dry]` | **(implemented)** Submit one `afterok`-wired `sbatch` job per artifact, then run a foreground (detachable) monitor that feeds the dashboard. |
+| `slurm ls\|status [SELECTOR…] [--expand] [--watch]` | **(implemented)** Stateless reconciliation (graph ⋈ `squeue`/`sacct`) showing per-class job state. |
+| `slurm cancel [SELECTOR…] [--dry]` | **(implemented)** `scancel` the matching running/queued jobs. |
+| `slurm sendcommand '<tmpl>' [SELECTOR…] [--dry]` | **(implemented)** Run a per-job command, substituting `{jobid}`/`{relpath}`/`{name}`/`{state}`/`{cls}`/`{partition}` (e.g. `scontrol update jobid={jobid} nice=100`). |
+| `slurm attach [RUN_ID]` · `slurm logs SELECTOR` | **(implemented)** Resume a detached/finished run's monitor; print a job's captured log. |
+| `dashboard [--port 7000] [--host H] [--open]` | **(implemented)** dependency-free web monitor for *all* runs (live and past). Watches the run registry — new parallel/slurm runs appear on their own — and replays each run's event log. A run is shown grouped into **pipeline steps** (by artifact type, like `plan`), each expandable to its instances, with already-committed artifacts marked **cached**; an "all runs" tab shows every run expanded inline. Per-job logs are live-tailed over SSE. Project-independent. |
 | `dryrun [SELECTOR…]` | Plan + order + freshness + future planning; print plan, `relpath`s, paths, automatically resolved selections or user-managed future fields, and (Slurm) `sbatch`/`afterok` wiring — without building. |
 | `plan [SELECTOR…] [--expand] [--nofresh]` | **(implemented)** Condensed ASCII view of the scheduler plan — collapses artifacts **by type** (counts) and **by repetition** (the per-artifact DAG projected onto a per-type DAG, fan-out shown as `2× per A`, fan-in noted inline). `--expand` lists instances; `--nofresh` skips the committed-vs-build check. |
 | `status [SELECTOR…]` | Per-artifact state: committed / running / queued / failed / blocked, with job ids. |
@@ -173,7 +183,11 @@ name to attach a stderr handler that narrates what the framework is doing:
 PIPELINES_VERBOSITY=info pipelines run baseline
 ```
 
-At `info` the narration covers the interesting seams: the graph collection and freshness pass, each
+At `info` the narration covers the interesting seams. Capitalized one-line **phase banners** mark
+the start of each stage of a launch — "Building job dependency graph", "Checking if objects are
+committed", "Materializing N artifact(s)" (sequential) or "Detecting available compute resources" /
+"Launching parallel scheduler (N job(s) to run)" (parallel) — so the detailed lines that follow are
+easy to group. Underneath, the narration covers the graph collection and freshness pass, each
 `materialize` decision (cache hit/miss, dependency readying, construct, commit), future-field
 resolution, session open/reuse, and — most concretely — every Store existence check **together with
 how it resolved** (e.g. "checking whether `…` is committed (dir `/…`)" immediately followed by "`…`

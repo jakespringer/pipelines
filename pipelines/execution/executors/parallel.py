@@ -47,7 +47,8 @@ class ParallelExecutor:
         self.runfile = runfile or os.environ.get("_PIPELINES_RUNFILE")
 
     # ------------------------------------------------------------------ #
-    def run(self, targets, *, force: bool = False, dry: bool = False) -> int:
+    def run(self, targets, *, force: bool = False, force_all: bool = False,
+            dry: bool = False) -> int:
         if not self.store or self.base_path is None:
             raise SystemExit(
                 "ParallelExecutor needs a store and base_path; the configured executor in "
@@ -57,35 +58,43 @@ class ParallelExecutor:
                 "runparallel must be launched via the `pipelines` CLI (no project run.py known).")
 
         base_path = _as_path(self.base_path)
-        plan = self._plan(targets, base_path)
+        plan = self._plan(targets, base_path, force=force, force_all=force_all)
         universe = {a.relpath: a for a in plan.ordered}
-        satisfied = set() if force else {a.relpath for a in plan.satisfied}
+        # Forced artifacts are already excluded from satisfied/transient_skipped by build_plan, so
+        # they fall into ``specs`` and the (cache-bypassing) worker rebuilds them.
+        satisfied = {a.relpath for a in plan.satisfied}
+        skipped = {a.relpath for a in plan.transient_skipped}
+        omit = satisfied | skipped
 
         def deps_of(a):
             return [d.relpath for d in a.dependencies() if d.relpath in universe]
 
-        specs = [(a, deps_of(a)) for a in plan.ordered if a.relpath not in satisfied]
+        specs = [(a, deps_of(a)) for a in plan.ordered if a.relpath not in omit]
         # The full plan in topological order — every artifact, its type, its in-plan deps, and
-        # whether it was already committed. The run server records this so a monitor can show the
-        # experiment's structure (grouped by step) and what was skipped as already cached.
+        # whether it was already committed or pruned as an unneeded transient. The run server
+        # records this so a monitor can show the experiment's structure (grouped by step) and
+        # what was skipped (already cached, or transient with no running consumer).
         manifest = [
             {"relpath": a.relpath, "cls": type(a).__name__, "deps": deps_of(a),
-             "cached": a.relpath in satisfied}
+             "cached": a.relpath in satisfied, "skipped": a.relpath in skipped}
             for a in plan.ordered
         ]
+        log.info("Detecting available compute resources")
         pool = detect_pool(self.gpus, self.cpus, self.memory_mb)
 
         if dry:
-            return self._dryrun(specs, satisfied, pool, base_path)
+            return self._dryrun(specs, satisfied, skipped, pool, base_path)
 
         if not specs:
-            print(f"pipelines: nothing to build ({len(satisfied)} already committed)")
+            extra = f", {len(skipped)} transient skipped" if skipped else ""
+            print(f"pipelines: nothing to build ({len(satisfied)} already committed{extra})")
             return 0
 
         worker_argv_prefix = [
             sys.executable, "-m", "pipelines", "--project", str(self.runfile),
             "_worker", "--store", self.store, "--base-path", str(base_path),
         ]
+        log.info("Launching parallel scheduler (%d job(s) to run)", len(specs))
         server = RunServer(
             specs=specs, done=satisfied, pool=pool,
             worker_argv_prefix=worker_argv_prefix,
@@ -98,18 +107,21 @@ class ParallelExecutor:
         return self.run(targets, dry=True)
 
     # ------------------------------------------------------------------ #
-    def _plan(self, targets, base_path: Path):
+    def _plan(self, targets, base_path: Path, *, force: bool = False,
+              force_all: bool = False):
         # build_plan's freshness pass calls exists(), which needs an active context to
         # resolve each artifact's store. Set one just for planning.
+        force_relpaths = [a.relpath for a in targets] if force else ()
         rc = RuntimeContext(base_path=base_path, executor_store=self.store, log=log)
         token = runtime._CTX.set(rc)
         try:
-            return build_plan(targets)
+            return build_plan(targets, force=force_relpaths, force_all=force_all)
         finally:
             runtime._CTX.reset(token)
 
-    def _dryrun(self, specs, satisfied, pool, base_path: Path) -> int:
-        print(f"# parallel plan: {len(specs)} to build, {len(satisfied)} committed")
+    def _dryrun(self, specs, satisfied, skipped, pool, base_path: Path) -> int:
+        extra = f", {len(skipped)} transient skipped" if skipped else ""
+        print(f"# parallel plan: {len(specs)} to build, {len(satisfied)} committed{extra}")
         print(f"# host pool: {pool.snapshot()}")
         for a, deps in specs:
             from ...scheduler.resources import ResourceRequest
@@ -119,6 +131,8 @@ class ParallelExecutor:
             print(f"  [build] {a.relpath}  ({req.describe()}) {fit}{dep_note}")
         for rp in sorted(satisfied):
             print(f"  [skip ] {rp}")
+        for rp in sorted(skipped):
+            print(f"  [trans] {rp}  (transient, no running consumer)")
         return 0
 
 

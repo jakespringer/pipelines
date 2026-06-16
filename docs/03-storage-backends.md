@@ -49,8 +49,14 @@ class Store(abc.ABC):
   retrieve for `@derived(reads=...)` ([05 §1](05-futures-derived.md)).
 - **`exists` must never be on the hot path**: `retrieve`/`get_dir` assume existence and raise if the
   directory was never committed; only the scheduler calls `exists`/`exists_many` ([06 §2](06-execution.md)).
-- **Registry:** `_REGISTRY = {"file": FileStore, "gs": GSStore, "wandb": WandbStore, "http": HttpStore,
-  "https": HttpStore, "hf": HttpStore}`. Adding a backend = "write one class + register".
+- **Registry:** `_REGISTRY = {"file": FileStore, "gs": GSStore, "link": LinkStore, "wandb": WandbStore,
+  "http": HttpStore, "https": HttpStore, "hf": HttpStore}`. Adding a backend = "write one class + register".
+- **`link://` (`store/link.py`)** is a local `FileStore` subclass for very large artifacts (model
+  checkpoints): `get_dir` materializes by **symlink** (`dest -> root/relpath`) instead of copying, and
+  `put_dir` **moves** the built directory into the store (a rename on a shared filesystem) then leaves a
+  symlink at the working path — so a checkpoint is stored exactly once and never copied per consumer. It
+  is a filesystem backend, so anything stored under `link://` is never uploaded. `only=` is ignored (the
+  symlink exposes the whole directory); `exists`/`delete` are inherited from `FileStore`.
 
 ---
 

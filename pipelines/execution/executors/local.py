@@ -29,7 +29,8 @@ class LocalExecutor:
         Store.from_uri(self.store)              # validate scheme early
 
     # ------------------------------------------------------------------ #
-    def run(self, targets, *, dry: bool = False, force: bool = False) -> int:
+    def run(self, targets, *, dry: bool = False, force: bool = False,
+            force_all: bool = False) -> int:
         rc = RuntimeContext(base_path=self.base_path, executor_store=self.store,
                             log=log, python=self.python)
         token = runtime._CTX.set(rc)
@@ -37,19 +38,25 @@ class LocalExecutor:
         sessions: dict = {}
         failed: list[str] = []
         try:
-            plan = build_plan(targets)
+            # --force rebuilds only the selected targets; --force-all rebuilds the whole graph.
+            force_relpaths = [a.relpath for a in targets] if force else ()
+            plan = build_plan(targets, force=force_relpaths, force_all=force_all)
             if dry:
                 _print_plan(plan, self.base_path)
                 return 0
+            log.info("Materializing %d artifact(s)", len(plan.to_build))
             for a in plan.ordered:
-                if a in plan.satisfied and not force:
-                    log.info("skip (committed) %s", a.relpath)
+                if a in plan.satisfied or a in plan.transient_skipped:
+                    reason = "committed" if a in plan.satisfied else "transient, no running consumer"
+                    log.info("skip (%s) %s", reason, a.relpath)
                     continue
                 rc.relpath = a.relpath
                 rc.annotations = dict(a.annotations or {})
                 rc.session = _ensure_session(a, sessions, rc)
                 try:
-                    materialize(a, scheduler=not force, strict=False)
+                    # Forced artifacts bypass the materialize-time cache check; others (uncommitted
+                    # dependencies) keep it so an already-committed input is retrieved, not rebuilt.
+                    materialize(a, scheduler=a not in plan.forced, strict=False)
                     log.info("built %s", a.relpath)
                 except Exception:
                     log.exception("FAILED %s", a.relpath)
@@ -87,9 +94,15 @@ def _ensure_session(a, sessions: dict, rc: RuntimeContext):
 
 
 def _print_plan(plan, base_path: Path) -> None:
-    print(f"# plan: {len(plan.to_build)} to build, {len(plan.satisfied)} committed")
+    extra = f", {len(plan.transient_skipped)} transient skipped" if plan.transient_skipped else ""
+    print(f"# plan: {len(plan.to_build)} to build, {len(plan.satisfied)} committed{extra}")
     for a in plan.ordered:
-        state = "skip" if a in plan.satisfied else "build"
+        if a in plan.satisfied:
+            state = "skip"
+        elif a in plan.transient_skipped:
+            state = "transient"
+        else:
+            state = "build"
         print(f"  [{state}] {a.relpath}  ->  {base_path / a.relpath}")
 
 

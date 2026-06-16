@@ -23,9 +23,16 @@ _FRESHNESS_WORKERS = 8
 
 @dataclasses.dataclass
 class Plan:
-    ordered: list                       # topological order; satisfied retained for ordering
-    to_build: set
-    satisfied: set
+    ordered: list                       # topological order; satisfied/skipped retained for ordering
+    to_build: set                       # will build (excludes satisfied and transient_skipped)
+    satisfied: set                      # already committed
+    # transient artifacts (``@artifact(transient=True)``) pruned because nothing that
+    # will actually run depends on them; a forced artifact that consumes one keeps it.
+    transient_skipped: set = dataclasses.field(default_factory=set)
+    # Artifacts rebuilt unconditionally (``--force`` ⇒ the selected targets, ``--force-all`` ⇒ the
+    # whole reachable graph). Dropped from ``satisfied`` so they land in ``to_build``; executors also
+    # read this to bypass the materialize-time cache check for these artifacts.
+    forced: set = dataclasses.field(default_factory=set)
 
 
 def collect(targets) -> dict:
@@ -68,19 +75,75 @@ def toposort(universe: dict) -> list:
     return ordered
 
 
-def build_plan(targets) -> Plan:
-    """Collect, validate, order, and run the freshness pass (under an active context)."""
+def build_plan(targets, *, force=(), force_all: bool = False) -> Plan:
+    """Collect, validate, order, and run the freshness pass (under an active context).
+
+    ``force`` is the set of selected-target relpaths to rebuild unconditionally (``--force``);
+    ``force_all`` rebuilds every reachable artifact (``--force-all``). Forced artifacts are
+    treated as not-committed (dropped from ``satisfied``, so they land in ``to_build``) and seed
+    the transient prune so any transient intermediate a forced artifact needs is retained.
+    """
     targets = list(targets)
+    log.info("Building job dependency graph")
     universe = collect(targets)
     log.info("graph: collected %d reachable artifact(s) from %d target(s)",
              len(universe), len(targets))
     check_collisions(universe.values())
     ordered = toposort(universe)
-    log.info("graph: freshness pass over %d artifact(s)", len(ordered))
-    satisfied = _freshness(ordered)
-    to_build = {a for a in ordered if a not in satisfied}
-    log.info("graph: %d already committed, %d to build", len(satisfied), len(to_build))
-    return Plan(ordered=ordered, to_build=to_build, satisfied=satisfied)
+    if force_all:
+        forced = set(universe.values())
+    else:
+        force = set(force)
+        forced = {a for a in universe.values() if a.relpath in force}
+    log.info("Checking if objects are committed (%d artifact(s))", len(ordered))
+    satisfied = _freshness(ordered) - forced       # forced artifacts always rebuild
+    unsatisfied = [a for a in ordered if a not in satisfied]
+    transient_skipped = _prune_transient(unsatisfied, forced)
+    to_build = {a for a in unsatisfied if a not in transient_skipped}
+    forced_note = f", {len(forced)} forced" if forced else ""
+    if transient_skipped:
+        log.info("graph: %d already committed, %d to build%s, %d transient skipped "
+                 "(no running consumer)", len(satisfied), len(to_build), forced_note,
+                 len(transient_skipped))
+    else:
+        log.info("graph: %d already committed, %d to build%s",
+                 len(satisfied), len(to_build), forced_note)
+    return Plan(ordered=ordered, to_build=to_build, satisfied=satisfied,
+                transient_skipped=transient_skipped, forced=forced)
+
+
+def _prune_transient(unsatisfied, forced=()) -> set:
+    """Transient artifacts in the to-build set that no artifact-that-will-run requires.
+
+    A ``@artifact(transient=True)`` is an on-demand intermediate: it should build only
+    when some artifact that will actually run *this* invocation depends on it. Seed the
+    "will run" set with every *non-transient* unsatisfied artifact (those always build)
+    plus every ``forced`` artifact (rebuilt unconditionally even if normally transient),
+    then walk down dependency edges within the unsatisfied set — each will-run artifact
+    pulls in every unsatisfied input it needs (transient or not), transitively. Any
+    transient artifact not reached this way has no running consumer and is skipped.
+
+    Pruning is safe precisely because a skipped artifact has no running dependent, so no
+    ``materialize`` ``_ready_dep`` ever tries to resurrect it. ``--force-all`` forces the
+    whole graph, so every artifact is seeded and nothing is pruned.
+    """
+    unsat = set(unsatisfied)
+    if not any(a.__pipelines__.transient for a in unsat):
+        return set()                              # no transient artifacts: common fast path
+    forced = set(forced)
+    by_relpath = {a.relpath: a for a in unsat}
+    needed: set = set()
+    stack = [a for a in unsat if not a.__pipelines__.transient or a in forced]
+    while stack:
+        a = stack.pop()
+        if a in needed:
+            continue
+        needed.add(a)
+        for d in a.dependencies():
+            dep = by_relpath.get(d.relpath)       # only unsatisfied deps still need building
+            if dep is not None and dep not in needed:
+                stack.append(dep)
+    return {a for a in unsat if a.__pipelines__.transient and a not in needed}
 
 
 def _freshness(ordered) -> set:

@@ -17,6 +17,7 @@ import fnmatch
 import json
 import logging
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -45,6 +46,31 @@ def _exists_workers() -> int:
 _MANIFEST = ".pipelines/manifest.json"
 
 
+def _retry(fn, *, what: str = "gs op", attempts: int = 6, base: float = 1.0, cap: float = 20.0):
+    """Call ``fn()``, retrying *transient* GCS errors (5xx / 429) with exponential
+    backoff. Non-transient errors (and the final attempt) propagate unchanged.
+
+    GCS occasionally returns ``503 ServiceUnavailable`` ("internal error, please try
+    again") or ``429`` on otherwise-fine requests; without this a single blip aborts a
+    whole job mid-commit (the generation/training is done but the publish fails). Every
+    wrapped op here is idempotent (delete / overwrite-upload / list), so retrying is safe.
+    """
+    import time
+    from google.api_core.exceptions import ServerError, TooManyRequests
+    transient = (ServerError, TooManyRequests)
+    delay = base
+    for i in range(attempts):
+        try:
+            return fn()
+        except transient as e:
+            if i == attempts - 1:
+                raise
+            log.warning("gs store: transient error on %s (%s); retry %d/%d in %.1fs",
+                        what, type(e).__name__, i + 1, attempts - 1, delay)
+            time.sleep(delay)
+            delay = min(cap, delay * 2)
+
+
 @register("gs")
 class GSStore(Store):
     def __init__(self, root: str):
@@ -59,23 +85,27 @@ class GSStore(Store):
         self._client = None
         self._bucket = None
         self._tm = None
+        self._init_lock = threading.Lock()
 
     # --- lazy client (the only place google.cloud is imported) ------------- #
     def _ensure(self):
         if self._bucket is None:
-            try:
-                from google.cloud import storage
-                from google.cloud.storage import transfer_manager
-            except ImportError as e:
-                raise ImportError(
-                    "the gs:// store backend requires google-cloud-storage; install "
-                    "it with `pip install google-cloud-storage` (or "
-                    "`pip install pipelines[gs]`)"
-                ) from e
-            self._client = storage.Client()
-            self._size_connection_pool(self._client)
-            self._bucket = self._client.bucket(self._bucket_name)
-            self._tm = transfer_manager
+            with self._init_lock:            # one store is shared across reader threads
+                if self._bucket is None:
+                    try:
+                        from google.cloud import storage
+                        from google.cloud.storage import transfer_manager
+                    except ImportError as e:
+                        raise ImportError(
+                            "the gs:// store backend requires google-cloud-storage; install "
+                            "it with `pip install google-cloud-storage` (or "
+                            "`pip install pipelines[gs]`)"
+                        ) from e
+                    client = storage.Client()
+                    self._size_connection_pool(client)
+                    self._client = client
+                    self._tm = transfer_manager
+                    self._bucket = client.bucket(self._bucket_name)  # publish last: it gates the fast path
         return self._bucket
 
     @staticmethod
@@ -138,14 +168,16 @@ class GSStore(Store):
                  self._bucket_name, prefix, dest, f" (only {only})" if only else "")
         # transfer_manager forms each object name as blob_name_prefix + name and
         # writes it to dest/name, so pass relpath-relative names (prefix stripped).
-        rels = [
-            b.name[len(prefix):]
+        # Keep each blob's size so we can skip files already materialized locally.
+        sizes = {
+            b.name[len(prefix):]: b.size
             for b in self._client.list_blobs(self._bucket, prefix=prefix)
             if not b.name.startswith(prefix + ".pipelines/")
-        ]
-        if not rels and not self._bucket.blob(self._manifest_name(relpath)).exists():
+        }
+        if not sizes and not self._bucket.blob(self._manifest_name(relpath)).exists():
             log.info("gs store: %r is not committed; cannot retrieve", relpath)
             raise FileNotFoundError(f"not committed at {relpath!r} in {self.root}")
+        rels = list(sizes)
         if only is not None:
             rels = [r for r in rels if _matches(Path(r), only)]
         dest = Path(dest)
@@ -153,9 +185,22 @@ class GSStore(Store):
         if not rels:
             log.info("gs store: %r committed but has no data files to download", relpath)
             return
-        log.info("gs store: downloading %d files for %r", len(rels), relpath)
+        # Skip files already present locally at the committed size (rsync-style): a
+        # re-run that still has the cache under base_path then transfers no bytes.
+        # Relpaths are config-fingerprinted, so a same-path/same-size-different-content
+        # collision is not a real concern for committed outputs.
+        todo = [r for r in rels
+                if sizes[r] is None
+                or not (dest / r).is_file()
+                or (dest / r).stat().st_size != sizes[r]]
+        if len(todo) < len(rels):
+            log.info("gs store: %r — %d/%d files already local (size match), skipping",
+                     relpath, len(rels) - len(todo), len(rels))
+        if not todo:
+            return
+        log.info("gs store: downloading %d files for %r", len(todo), relpath)
         self._tm.download_many_to_path(
-            self._bucket, rels,
+            self._bucket, todo,
             destination_directory=str(dest),
             blob_name_prefix=prefix,
             create_directories=True,
@@ -175,22 +220,23 @@ class GSStore(Store):
         # exists() report not-committed for the whole re-publish window.
         self._delete_prefix(base + "/")
         if rels:
-            self._tm.upload_many_from_filenames(
+            _retry(lambda: self._tm.upload_many_from_filenames(
                 self._bucket, rels,
                 source_directory=str(src),
                 blob_name_prefix=base + "/",
                 worker_type="thread",
                 max_workers=_MAX_WORKERS,
                 raise_exception=True,
-            )
+            ), what=f"upload {len(rels)} files for {relpath!r}")
         # Manifest last == the atomic commit point.
         manifest = {
             "completed": True,
             "relpath": relpath,
             "files": [{"path": r, "size": (src / r).stat().st_size} for r in rels],
         }
-        self._bucket.blob(self._manifest_name(relpath)).upload_from_string(
-            json.dumps(manifest, indent=2), content_type="application/json")
+        _retry(lambda: self._bucket.blob(self._manifest_name(relpath)).upload_from_string(
+            json.dumps(manifest, indent=2), content_type="application/json"),
+            what=f"write manifest for {relpath!r}")
         log.info("gs store: published %r (manifest written == commit point)", relpath)
 
     def delete(self, relpath: str) -> None:
@@ -205,14 +251,15 @@ class GSStore(Store):
 
         def _drop(blob):
             try:
-                blob.delete()
+                _retry(lambda: blob.delete(), what="delete blob")
             except NotFound:
                 pass
 
         # Remove the manifest first so exists() flips to False before the
         # (slower) data deletion runs.
         _drop(self._bucket.blob(prefix + _MANIFEST))
-        rest = list(self._client.list_blobs(self._bucket, prefix=prefix))
+        rest = _retry(lambda: list(self._client.list_blobs(self._bucket, prefix=prefix)),
+                      what="list_blobs")
         if rest:
             with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
                 list(pool.map(_drop, rest))

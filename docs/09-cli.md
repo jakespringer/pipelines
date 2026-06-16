@@ -59,29 +59,41 @@ from a bare `relpath` against its selected Store (nothing is rebuilt).
 
 ## 3. Commands
 
+Backend-specific verbs are **namespaced** `pipelines <backend> <verb>` (`local`/`parallel`/`slurm`),
+dispatched in `cli._dispatch` (`_parallel_group`/`_local_group`, and `execution/executors/slurm_cli.py`
+for `slurm`). Backend-independent verbs stay top-level. `runparallel`/`attach` are kept as deprecated
+aliases for `parallel run`/`parallel attach`.
+
 | Command | Behavior |
 |---------|----------|
-| `run [SEL…] [--target G] [--force/--force-all] [--head/--tail N] [--executor X]` | Build the selection ([06](06-execution.md)). `--executor local` overrides to `LocalExecutor` for reproduction. |
+| `run [SEL…] [--force/--force-all]` | Build the selection with the **configured** executor ([06](06-execution.md)). `--force` rebuilds **only the selected targets** (the named group members / glob matches) even if committed — their dependencies keep normal freshness (a committed input is retrieved, not rebuilt). `--force-all` rebuilds the **whole reachable graph** and also builds `@artifact(transient=True)` intermediates otherwise skipped ([06 §2](06-execution.md)). |
+| `local run [SEL…] [--force/--force-all]` | Sequential, in-process `LocalExecutor` (debug/reproduction). |
+| `parallel run [SEL…] [--gpus/--cpus/--memory N] [--force/--force-all] [--dry]` · `parallel attach [PORT]` | Resource-aware local parallel build via the run server; tmux-style live monitor. |
+| `slurm run [SEL…] [--force/--force-all] [--detach] [--dry]` | Submit one `afterok`-wired `sbatch` job per artifact (`execution/executors/slurm.py`), then a foreground (detachable) monitor (`scheduler/slurm_monitor.py`) feeds the dashboard. `--skip-committed` is passed to ordinary workers so requeued tasks skip committed work (omitted for `--force`-d artifacts, which must rebuild). |
+| `slurm ls\|status [SEL…] [--expand] [--watch]` · `slurm cancel [SEL…] [--dry]` | Stateless `squeue`/`sacct` reconciliation by class; `scancel` the matching jobs (§4). |
+| `slurm sendcommand '<tmpl>' [SEL…] [--dry]` | Per-job command with `{jobid}`/`{relpath}`/`{name}`/`{state}`/`{cls}`/`{partition}` substitution. |
+| `slurm attach [RUN_ID]` · `slurm logs SEL` | Resume a detached/finished run's monitor; print a job's captured log. |
 | `dryrun [SEL…]` | Plan + order + freshness + future planning; print plan, `relpath`s, resolved paths, auto-resolved/user-managed future fields, and (Slurm) `sbatch`/`afterok` wiring — without building. |
 | `dashboard [--port 7000] [--host H] [--open]` | Serve the web monitor for all runs (live + past); see [12-dashboard.md](12-dashboard.md). Project-independent. |
-| `status [SEL…]` | Per-artifact state (committed/running/queued/failed/blocked) + job ids (§4). |
-| `logs SEL` | Stream/tail an artifact's log (or its Slurm job log). |
 | `ls [SEL]` | List store contents by `relpath` with size, age. |
 | `inspect SEL` | Print current graph/config and, if the artifact stored metadata, its provenance (§5). |
 | `lineage SEL [--up/--down]` | Trace ancestors/descendants over the imported graph. |
 | `rm SEL [--down]` | Delete outputs (optionally cascade) — the safe wrapper around hand-`rm`. |
 | `gc [--keep-reachable] [--older-than D] [--match GLOB]` | Prune using current-graph reachability ([03 §6](03-storage-backends.md)). |
-| `cancel [SEL…]` | Cancel running/queued Slurm jobs for the selection (§4). |
 | `viz [SEL…] [-o dag.svg]` | Render the DAG, colored by state (optional `networkx`+Graphviz). |
+
+Cluster job state/cancel are surfaced under the `slurm` group (`slurm ls`/`slurm cancel`, §4);
+`ls`/`inspect`/`lineage`/`rm`/`gc`/`viz` are graph/store verbs (planned top-level).
 
 `run` exits **non-zero** if any targeted artifact ended `failed` (CI-friendly). `dryrun --json` /
 `status --json` emit machine-readable plans/state.
 
 ---
 
-## 4. `status` / `cancel` — stateless reconciliation (M-6)
+## 4. `slurm ls` / `slurm cancel` — stateless reconciliation (M-6)
 
-`status` reconciles three sources, computed **fresh** each call, with **no stored job map**:
+Surfaced by `execution/executors/slurm_cli.py`'s `reconcile()` (`slurm ls`/`status`, `cancel`,
+`sendcommand`). It reconciles three sources, computed **fresh** each call, with **no stored job map**:
 1. **The graph** — re-import the project; expected artifacts + `relpath`s.
 2. **The scheduler** — `squeue`/`sacct`, filtered to this project via the `hash(project)` namespace
    prefix; matched to artifacts by recomputing each `hash(project, relpath)` (reverse map held in

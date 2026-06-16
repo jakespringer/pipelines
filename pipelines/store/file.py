@@ -39,9 +39,15 @@ class FileStore(Store):
     def exists(self, relpath: str) -> bool:
         final = self._final(relpath)
         log.info("file store: checking whether %r is committed (dir %s)", relpath, final)
-        result = final.is_dir()
+        # A commit atomically ``os.replace``s a fully-staged directory into place,
+        # so a committed artifact is always a NON-EMPTY directory. An empty dir is a
+        # broken/partial leftover (e.g. an interrupted or mis-committed chained
+        # model) — reporting it as committed would wrongly skip the rebuild and hand
+        # consumers an empty checkpoint, so treat it as not-committed.
+        result = final.is_dir() and any(final.iterdir())
         log.info("file store: %r %s", relpath,
-                 "exists (committed)" if result else "does not exist (not committed)")
+                 "exists (committed)" if result
+                 else "does not exist / empty (not committed)")
         return result
 
     def get_dir(self, relpath: str, dest: Path, only: list[str] | None = None) -> None:
@@ -86,7 +92,17 @@ def _copy_tree(src: Path, dst: Path, only: list[str] | None) -> None:
             continue
         target = dst / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, target)
+        # Atomic per-file: copy to a unique temp in the same directory, then
+        # os.replace into place. A plain in-place copy lets a concurrent reader
+        # (or another consumer retrieving the same artifact into a shared
+        # base_path — e.g. several eval jobs for one freshly-trained model) read
+        # a half-written file, which surfaces as a truncated/corrupt load.
+        tmp = target.parent / f".tmp-{target.name}-{uuid.uuid4().hex}"
+        try:
+            shutil.copy2(path, tmp)
+            os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def _matches(rel: Path, only: list[str]) -> bool:

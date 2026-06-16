@@ -7,10 +7,19 @@ Artifacts' default lifecycle delegates here. See ``docs/03-storage-backends.md``
 from __future__ import annotations
 
 import abc
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit
 
 _REGISTRY: dict[str, type["Store"]] = {}
+
+# Stores are configured purely by their root URI and are otherwise stateless apart
+# from a lazily-built client (e.g. GSStore's google client + connection pool), so a
+# URI maps to exactly one interchangeable Store. Memoizing keeps a fresh GSStore
+# (and a cold client/TLS pool) from being built on every retrieve — which matters a
+# lot when many artifacts, or many parallel reads, hit the same gs:// store.
+_INSTANCES: dict[str, "Store"] = {}
+_INSTANCES_LOCK = threading.Lock()
 
 
 def register(*schemes: str):
@@ -53,10 +62,18 @@ class Store(abc.ABC):
     def from_uri(cls, uri) -> "Store":
         if isinstance(uri, Store):
             return uri
-        scheme = urlsplit(str(uri)).scheme or "file"
+        key = str(uri)
+        cached = _INSTANCES.get(key)
+        if cached is not None:
+            return cached
+        scheme = urlsplit(key).scheme or "file"
         try:
             backend = _REGISTRY[scheme]
         except KeyError:
             raise ValueError(
                 f"no store backend for scheme {scheme!r} (have {sorted(_REGISTRY)})")
-        return backend(str(uri))
+        with _INSTANCES_LOCK:
+            store = _INSTANCES.get(key)
+            if store is None:
+                store = _INSTANCES[key] = backend(key)
+            return store

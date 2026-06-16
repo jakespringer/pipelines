@@ -30,17 +30,22 @@ class ArtifactSettings:
     session: Type["Session"] | None = None
     retries: int = 0
     env: dict | None = None                  # rare per-artifact env overrides (design/08 §8)
+    transient: bool = False                  # on-demand intermediate (06 §2 "Transient artifacts")
 ```
 
 ```python
 def artifact(cls=None, /, *, automaterialize=True, autocommit=True, cache=True,
-             store=None, session=None, retries=0, env=None):
+             store=None, session=None, retries=0, env=None, transient=False):
     """Class decorator. Usable bare (@artifact) or with args (@artifact(cache=False))."""
     def wrap(klass):
         return _build_artifact(klass, ArtifactSettings(
-            automaterialize, autocommit, cache, store, session, retries, env))
+            automaterialize, autocommit, cache, store, session, retries, env, transient))
     return wrap if cls is None else wrap(cls)
 ```
+
+`transient=True` marks an artifact that is scheduled **only** when something that will actually run
+depends on it; if nothing running needs it, the freshness/prune pass skips it even when missing
+(unless a forced artifact needs it, or `--force-all`). See [06 §2 "Transient artifacts"](06-execution.md).
 
 `@dataclass_transform(frozen_default=True, kw_only_default=True)` decorates `artifact` so type
 checkers treat decorated classes as frozen kw-only dataclasses (fields, `__init__`, immutability).
