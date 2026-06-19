@@ -366,7 +366,7 @@ def _usage(groups: dict[str, list]) -> int:
     print("  local run [SEL...] [--force]                       sequential, in-process")
     print("  parallel run [SEL...] [--gpus/--cpus/--memory N] [--force] [--dry]   local, parallel")
     print("  parallel attach [PORT]                             tmux-style live monitor")
-    print("  slurm run|ls|cancel|sendcommand|attach|logs ...    cluster (see `slurm help`)")
+    print("  slurm run|ls|cancel|sendcommand|attach|logs|cat ...   cluster (see `slurm help`)")
     print("groups:", ", ".join(sorted(groups)) or "(none)")
     return 0
 
@@ -446,6 +446,12 @@ def main(argv: list[str] | None = None) -> int:
     if attach_args is not None:
         from .scheduler.tui import attach_main
         return attach_main([a for a in attach_args if not a.startswith("-")])
+
+    # `slurm cat JOBID` locates a job's log purely from the run registry (no graph needed), so it
+    # runs from anywhere — handle it before discovering a run.py, like dashboard / parallel attach.
+    if rest[:2] == ["slurm", "cat"]:
+        from .execution.executors.slurm_cli import cat_main
+        return cat_main(rest[2:])
 
     run_file = _discover_run_file(project)
     project_dir = run_file.parent

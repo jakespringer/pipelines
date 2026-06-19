@@ -72,7 +72,7 @@ aliases for `parallel run`/`parallel attach`.
 | `slurm run [SEL…] [--force/--force-all] [--detach] [--dry]` | Submit one `afterok`-wired `sbatch` job per artifact (`execution/executors/slurm.py`), then a foreground (detachable) monitor (`scheduler/slurm_monitor.py`) feeds the dashboard. `--skip-committed` is passed to ordinary workers so requeued tasks skip committed work (omitted for `--force`-d artifacts, which must rebuild). |
 | `slurm ls\|status [SEL…] [--expand] [--watch]` · `slurm cancel [SEL…] [--dry]` | Stateless `squeue`/`sacct` reconciliation by class; `scancel` the matching jobs (§4). |
 | `slurm sendcommand '<tmpl>' [SEL…] [--dry]` | Per-job command with `{jobid}`/`{relpath}`/`{name}`/`{state}`/`{cls}`/`{partition}` substitution. |
-| `slurm attach [RUN_ID]` · `slurm logs SEL` | Resume a detached/finished run's monitor; print a job's captured log. |
+| `slurm attach [RUN_ID]` · `slurm logs SEL` · `slurm cat JOBID` | Resume a detached/finished run's monitor; print a job's captured log (by selector); print a job's captured log located by Slurm job id across the run registry (project-independent — runs from any directory). |
 | `dryrun [SEL…]` | Plan + order + freshness + future planning; print plan, `relpath`s, resolved paths, auto-resolved/user-managed future fields, and (Slurm) `sbatch`/`afterok` wiring — without building. |
 | `dashboard [--port 7000] [--host H] [--open]` | Serve the web monitor for all runs (live + past); see [12-dashboard.md](12-dashboard.md). Project-independent. |
 | `ls [SEL]` | List store contents by `relpath` with size, age. |

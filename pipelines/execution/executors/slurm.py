@@ -79,11 +79,14 @@ def as_slurm_time(value) -> str:
 class SlurmExecutor:
     def __init__(self, store=None, base_path=None, *, setup=None, defaults=None,
                  env=None, batch=None, run_dir=None, poll_interval=None, runfile=None,
-                 **kwargs):
+                 overrides=None, **kwargs):
         self.store = str(store) if store is not None else None
         self.base_path = base_path
         self.setup = setup
         self.defaults = dict(defaults or {})
+        # CLI-supplied Slurm directives (e.g. `slurm run --partition cpu`): highest precedence,
+        # winning over both `defaults` and per-artifact annotations (see `_resolve`).
+        self.overrides = dict(overrides or {})
         self.env = dict(env or {})
         self.batch = batch
         self.run_dir = run_dir
@@ -209,25 +212,30 @@ class SlurmExecutor:
         """Resolve an artifact to ``(portable_resources, slurm_directives)``.
 
         Levels, last wins: executor ``defaults`` < artifact ``annotations`` (incl. its ``"slurm"``
-        subdict). (The third level — CLI ``--annotate`` — is not wired into the CLI yet.) The
-        executor's defaults are backend-specific, so a non-portable top-level key there (``partition``,
-        ``time``, …) is itself a Slurm directive; in an artifact's annotations the same position is
-        free metadata, and Slurm-specific keys live under its ``"slurm"`` subdict.
+        subdict) < CLI ``overrides`` (e.g. ``slurm run --partition cpu``). The executor's defaults
+        and the CLI overrides are backend-specific, so a non-portable top-level key in either
+        (``partition``, ``time``, …) is itself a Slurm directive; in an artifact's annotations the
+        same position is free metadata, and Slurm-specific keys live under its ``"slurm"`` subdict.
         """
         portable: dict = {}
         slurm_d: dict = {}
-        for key, value in self.defaults.items():
-            if key in _PORTABLE:
-                portable[key] = value
-            elif key == "slurm":
-                slurm_d.update(value or {})
-            else:
-                slurm_d[key] = value
-        ann = dict(getattr(a, "annotations", {}) or {})
+
+        def _absorb(d):   # defaults/overrides: a non-portable top-level key *is* a Slurm directive
+            for key, value in (d or {}).items():
+                if key in _PORTABLE:
+                    portable[key] = value
+                elif key == "slurm":
+                    slurm_d.update(value or {})
+                else:
+                    slurm_d[key] = value
+
+        _absorb(self.defaults)                        # backend defaults (lowest precedence)
+        ann = dict(getattr(a, "annotations", {}) or {})   # artifact annotations (middle)
         for key in _PORTABLE:
             if key in ann:
                 portable[key] = ann[key]
         slurm_d.update(ann.get("slurm") or {})
+        _absorb(self.overrides)                       # CLI overrides (`--partition` …): win over all
         return portable, slurm_d
 
     def _directives(self, portable: dict, slurm_d: dict) -> list[str]:
@@ -314,6 +322,8 @@ class SlurmExecutor:
             print(f"# setup: {self.setup}")
         if self.defaults:
             print(f"# defaults: {self.defaults}")
+        if self.overrides:
+            print(f"# overrides (CLI): {self.overrides}")
         for a in to_submit:
             portable, slurm_d = self._resolve(a)
             directives = " ".join(self._directives(portable, slurm_d))

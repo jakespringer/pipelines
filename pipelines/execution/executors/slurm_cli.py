@@ -13,10 +13,12 @@ Subcommands:
   sendcommand '<tmpl>' [SEL] [--dry]       run a per-job command, substituting {jobid}/{relpath}/…
   attach [RUN_ID]                          resume the monitor for a detached/finished run
   logs SEL                                 print a job's captured log from the run dir
+  cat JOBID                                print a job's captured log, located by Slurm job id
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import shlex
 import shutil
@@ -25,9 +27,9 @@ import sys
 import time
 from pathlib import Path
 
-from ...identity import slug
 from ...project import Project
 from ...scheduler import registry
+from ...scheduler.server import job_log_path
 from .slurm import SlurmExecutor, job_name, project_prefix
 
 log = logging.getLogger("pipelines")
@@ -35,6 +37,17 @@ log = logging.getLogger("pipelines")
 # Columns for the grouped `ls` table: (label, event-state). ``None`` = artifact with no live job.
 _LS_COLS = [("RUN", "running"), ("PEND", "queued"), ("DONE", "completed"),
             ("FAIL", "failed"), ("CXL", "cancelled"), ("BLOCK", "blocked"), ("—", None)]
+
+# CLI opts on `slurm run` that map straight to Slurm submit directives and win over the executor's
+# defaults and per-artifact annotations (see SlurmExecutor._resolve). Resource sizing
+# (cpus/memory/gpus) deliberately stays on the portable annotation path, not overridable here.
+_SLURM_OPT_KEYS = ("partition", "account", "qos", "time", "constraint",
+                   "nodelist", "exclude", "reservation")
+
+
+def _slurm_overrides(opts: dict) -> dict:
+    """The Slurm-directive overrides (e.g. ``--partition cpu``) picked out of the parsed CLI opts."""
+    return {k: opts[k] for k in _SLURM_OPT_KEYS if k in opts}
 
 
 def main(groups: dict[str, list], executor, argv: list[str]) -> int:
@@ -51,7 +64,7 @@ def main(groups: dict[str, list], executor, argv: list[str]) -> int:
         if not targets:
             print(f"no targets matched {positionals or ['(none)']}", file=sys.stderr)
             return 2
-        return _slurm_executor(executor).run(
+        return _slurm_executor(executor, _slurm_overrides(opts)).run(
             targets, force="force" in flags, force_all="force-all" in flags,
             dry="dry" in flags, detach="detach" in flags)
 
@@ -65,9 +78,11 @@ def main(groups: dict[str, list], executor, argv: list[str]) -> int:
         return _attach(executor, positionals)
     if sub == "logs":
         return _logs(groups, executor, positionals, _resolve)
+    if sub == "cat":
+        return cat_main(rest)
 
     print(f"unknown slurm subcommand {sub!r} "
-          f"(have: run, ls, status, cancel, sendcommand, attach, logs)",
+          f"(have: run, ls, status, cancel, sendcommand, attach, logs, cat)",
           file=sys.stderr)
     return 2
 
@@ -212,21 +227,77 @@ def _logs(groups, executor, positionals, _resolve) -> int:
         print("pipelines: no slurm run found", file=sys.stderr)
         return 2
     for t in targets:
-        path = Path(logdir) / "jobs" / f"{slug(t.relpath)}.log"
-        print(f"==> {t.relpath}  ({path})")
-        try:
-            print(path.read_text())
-        except OSError:
-            print("  (no log yet)")
+        _print_log(t.relpath, job_log_path(logdir, t.relpath))
     return 0
+
+
+def cat_main(argv: list[str]) -> int:
+    """``pipelines slurm cat JOBID`` — print a job's captured log, located by Slurm job id.
+
+    Project-independent: the log is found purely from the run registry (the same default location
+    pipelines records every run under), so this runs from any directory — no ``run.py`` needed.
+    """
+    from ...cli import _parse                          # local import: cli is the caller
+
+    positionals, _opts, _flags = _parse(argv)
+    if not positionals:
+        print("usage: pipelines slurm cat JOBID", file=sys.stderr)
+        return 2
+    jobid = positionals[0]
+    found = _find_job(jobid)
+    if found is None:
+        print(f"pipelines: no slurm job {jobid!r} found in the run registry", file=sys.stderr)
+        return 1
+    relpath, logdir = found
+    _print_log(relpath, job_log_path(logdir, relpath))
+    return 0
+
+
+def _print_log(relpath: str, path: Path) -> None:
+    """Print one job's captured log with a header, or a placeholder if it isn't there yet."""
+    print(f"==> {relpath}  ({path})")
+    try:
+        print(path.read_text())
+    except OSError:
+        print("  (no log yet)")
+
+
+def _find_job(jobid: str) -> tuple[str, Path] | None:
+    """Find ``(relpath, logdir)`` for a Slurm job id by scanning run dirs in the registry.
+
+    Each slurm run dir's ``meta.json`` holds the ``relpath -> job id`` map the monitor submitted;
+    we invert it. Runs are scanned newest first, so a reused job id resolves to its latest run.
+    """
+    target = str(jobid)
+    for info in registry.list_runs(only_alive=False):     # newest first
+        if info.get("kind") != "slurm":
+            continue
+        logdir = info.get("logdir")
+        if not logdir:
+            continue
+        try:
+            meta = json.loads((Path(logdir) / "meta.json").read_text())
+        except (OSError, ValueError):
+            continue
+        for relpath, jid in (meta.get("jobids") or {}).items():
+            if str(jid) == target:
+                return relpath, Path(logdir)
+    return None
 
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def _slurm_executor(executor) -> SlurmExecutor:
-    """The configured executor if it is a SlurmExecutor, else one built from ``Project.config``."""
+def _slurm_executor(executor, overrides=None) -> SlurmExecutor:
+    """The configured executor if it is a SlurmExecutor, else one built from ``Project.config``.
+
+    ``overrides`` are CLI-supplied Slurm directives (e.g. ``--partition cpu``) that win over both
+    the executor ``defaults`` and per-artifact annotations (see ``SlurmExecutor._resolve``).
+    """
+    overrides = overrides or {}
     if isinstance(executor, SlurmExecutor):
+        if overrides:
+            executor.overrides = {**getattr(executor, "overrides", {}), **overrides}
         return executor
     cfg = Project.config
     get = (lambda k, d=None: cfg.get(k, d)) if cfg is not None else (lambda k, d=None: d)
@@ -235,6 +306,7 @@ def _slurm_executor(executor) -> SlurmExecutor:
         base_path=getattr(executor, "base_path", None) or get("base_path"),
         setup=get("slurm_setup"), defaults=get("slurm_defaults") or {},
         env=get("slurm_env") or {}, run_dir=get("slurm_run_dir"),
+        overrides=overrides,
     )
 
 
@@ -314,11 +386,13 @@ def _print_ls(recs: list[dict], expand: bool) -> None:
 
 
 def _usage() -> int:
-    print("usage: pipelines slurm <run|ls|status|cancel|sendcommand|attach|logs> [SELECTOR ...]")
-    print("  run [SEL...] [--force] [--detach] [--dry]   submit + foreground monitor")
+    print("usage: pipelines slurm <run|ls|status|cancel|sendcommand|attach|logs|cat> [SELECTOR ...]")
+    print("  run [SEL...] [--partition P] [--account A] [--qos Q] [--time T] [--force] [--detach] "
+          "[--dry]   submit + monitor (CLI Slurm directives override config/annotations)")
     print("  ls|status [SEL...] [--expand] [--watch]      reconciled status by artifact class")
     print("  cancel [SEL...] [--dry]                      scancel matching running/queued jobs")
     print("  sendcommand '<tmpl>' [SEL...] [--dry]        per-job cmd; {jobid}/{relpath}/{name}/…")
     print("  attach [RUN_ID]                              resume the monitor (newest if omitted)")
-    print("  logs SEL...                                  print a job's captured log")
+    print("  logs SEL...                                  print a job's captured log (by selector)")
+    print("  cat JOBID                                    print a job's captured log (by job id)")
     return 0
