@@ -9,8 +9,12 @@ See ``docs/10-config-project-packaging.md``.
 from __future__ import annotations
 
 import os
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib  # Python >= 3.11
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 
 class ConfigKeyError(AttributeError):

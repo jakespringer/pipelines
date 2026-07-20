@@ -7,18 +7,19 @@ name = "pipelines"
 version = "0.1.0"
 description = "Describe experiments as Artifacts and run their dependency graph, locally or on a cluster."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Jake Springer" }]
 keywords = ["experiments", "pipeline", "dataflow", "dependency-graph", "ml"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Operating System :: POSIX :: Linux",
 ]
-# Core is pure standard library (Python >= 3.11 for `tomllib`).
-dependencies = []
+# Core is pure standard library; `tomli` only backfills stdlib `tomllib` on Python 3.10.
+dependencies = ['tomli; python_version < "3.11"']
 
 [project.optional-dependencies]
 gs = ["google-cloud-storage"]  # gs:// store backend

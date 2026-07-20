@@ -181,11 +181,11 @@ from_uri, publish_atomic, write_meta
 
 ## 5. Environment and dependencies
 
-- **Python ≥ 3.11** (`tomllib` in stdlib; `typing.dataclass_transform`; `dataclasses(kw_only=)`).
+- **Python ≥ 3.10** (`dataclasses(kw_only=)`). On 3.10 `tomli` backfills stdlib `tomllib`
+  (auto-installed via an environment marker); 3.11+ uses `tomllib` from stdlib.
 - **Required runtime deps:** `google-cloud-storage` (gs backend), `huggingface_hub` (`source.hf`).
 - **Optional extras:** `wandb` (`wandb://` mirror), `rich` (CLI tables/logs), `networkx` + a Graphviz
-  binary (`viz`), `pandas` (`gather(...).to_frame()`), `tomli` only if a 3.10 fallback is ever needed
-  (default target is 3.11+, so stdlib `tomllib`).
+  binary (`viz`), `pandas` (`gather(...).to_frame()`).
 - **No DSL dependency, no flock files.** Atomicity is store-native (rename / manifest); see
   [03 §3](03-storage-backends.md).
 

@@ -77,7 +77,7 @@ built-in defaults
   wandb_api_key     = "..."
   ```
 
-Parse with stdlib `tomllib` (Python ≥ 3.11). Discovery walks up from `from_file`'s directory collecting
+Parse with `tomllib` (stdlib on Python ≥ 3.11; the `tomli` backport on 3.10). Discovery walks up from `from_file`'s directory collecting
 every `pipelines.toml` until filesystem root (or a marker), applying ancestor→nearer order. The
 `[project].name` in the versioned file must match the `Project.init` name (warn/error on mismatch).
 
@@ -103,8 +103,8 @@ configured local storage. Explicit executor args remain the final override:
 ```toml
 [project]
 name = "pipelines"
-requires-python = ">=3.11"
-dependencies = ["google-cloud-storage", "huggingface_hub"]
+requires-python = ">=3.10"
+dependencies = ["google-cloud-storage", "huggingface_hub", 'tomli; python_version < "3.11"']
 
 [project.optional-dependencies]
 wandb = ["wandb"]

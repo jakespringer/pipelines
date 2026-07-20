@@ -151,6 +151,32 @@ function manualReconnect() {
 }
 
 // --------------------------------------------------------------------------- //
+// Persisted UI preferences — small, client-only view settings (e.g. the runs
+// status filter) kept in localStorage so a chosen view survives navigation
+// between the Runs / All runs tabs and full reloads. Stored client-side rather
+// than as a cookie so the preference never rides along on every request to the
+// server. If storage is blocked (private mode) it degrades to an in-memory cache
+// for the session — the app still works, just without persistence.
+// --------------------------------------------------------------------------- //
+const PREFS_KEY = "pipelines.prefs";
+let prefsCache = null;
+function prefs() {
+  if (!prefsCache) {
+    try { prefsCache = JSON.parse(localStorage.getItem(PREFS_KEY) || "{}") || {}; }
+    catch { prefsCache = {}; }
+  }
+  return prefsCache;
+}
+function getPref(key, fallback) {
+  const v = prefs()[key];
+  return v === undefined ? fallback : v;
+}
+function setPref(key, value) {
+  prefs()[key] = value;
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefsCache)); } catch { /* storage blocked */ }
+}
+
+// --------------------------------------------------------------------------- //
 // Shared run poll — feeds the header always, and the dashboard while mounted.
 // Also tracks the server/client clock offset so elapsed times survive skew.
 // --------------------------------------------------------------------------- //
@@ -261,6 +287,17 @@ function runStatusPill(r) {
   if ((r.live || r.status === "live") && cs !== "online")
     return disconnectedPill(cs === "forbidden" ? "blocked" : "disconnected");
   return pill(r.status);
+}
+
+// Status filter <select>, shared by the Runs and All-runs pages. The chosen value is a persisted
+// preference ("runStatus"), so filtering to e.g. "Live" sticks across navigation and reloads, and
+// changing it on either page carries over to the other.
+const STATUS_FILTERS = [["all", "All statuses"], ["live", "Live"], ["completed", "Completed"], ["failed", "Failed"], ["interrupted", "Interrupted"]];
+function statusFilter(current, onPick) {
+  const sel = h("select", { class: "field" }, ...STATUS_FILTERS.map(([v, label]) => h("option", { value: v }, label)));
+  sel.value = current;
+  sel.addEventListener("change", () => onPick(sel.value));
+  return sel;
 }
 
 function segBar(counts, total, extra) {
@@ -534,7 +571,7 @@ function countsOf(step) {
 // --------------------------------------------------------------------------- //
 function Dashboard(root, focus) {
   setNav("runs"); setCrumbs([]);
-  let status = "all", query = "", sig = null;
+  let status = getPref("runStatus", "all"), query = "", sig = null;
   const expanded = new Map();   // group name -> explicit open bool (user choice)
   const toggled = new Set();    // groups the user has decided about (overrides the auto rule)
   if (focus) { toggled.add(focus); expanded.set(focus, true); }   // arrived from a sidebar group
@@ -542,9 +579,7 @@ function Dashboard(root, focus) {
 
   const sub = h("span", { class: "sub" });
   const stats = h("div", { class: "stats" });
-  const statusSel = h("select", { class: "field", onchange: () => { status = statusSel.value; draw(true); } },
-    ...[["all", "All statuses"], ["live", "Live"], ["completed", "Completed"], ["failed", "Failed"], ["interrupted", "Interrupted"]]
-      .map(([v, label]) => h("option", { value: v }, label)));
+  const statusSel = statusFilter(status, (v) => { status = v; setPref("runStatus", v); draw(true); });
   const searchInput = h("input", { type: "search", placeholder: "Search runs" });
   searchInput.addEventListener("input", () => { query = searchInput.value.trim().toLowerCase(); draw(true); });
   const toolbar = h("div", { class: "toolbar" },
@@ -727,17 +762,19 @@ function patchRunRow(tr, r) {
 // --------------------------------------------------------------------------- //
 function Overview(root) {
   setNav("all"); setCrumbs([]);
-  let query = "", last = { runs: [] };
+  let status = getPref("runStatus", "all"), query = "", last = { runs: [] };
   const sub = h("span", { class: "sub" });
+  const statusSel = statusFilter(status, (v) => { status = v; setPref("runStatus", v); render(last); });
   const searchInput = h("input", { type: "search", placeholder: "Search runs" });
   searchInput.addEventListener("input", () => { query = searchInput.value.trim().toLowerCase(); render(last); });
-  const toolbar = h("div", { class: "toolbar" }, h("span", { class: "grow" }), h("label", { class: "field search" }, iconSearch(), searchInput));
+  const toolbar = h("div", { class: "toolbar" }, statusSel, h("span", { class: "grow" }), h("label", { class: "field search" }, iconSearch(), searchInput));
   const list = h("div", { class: "run-list" });
   root.append(h("div", { class: "page-head" }, h("h1", {}, "All runs"), sub), toolbar, list);
 
   const blocks = new Map();
   let dead = false;
-  const match = (r) => !query || (r.project || "run").toLowerCase().includes(query) || String(r.port).includes(query);
+  const match = (r) => (status === "all" || r.status === status)
+    && (!query || (r.project || "run").toLowerCase().includes(query) || String(r.port).includes(query));
 
   function render(data) {
     last = data;

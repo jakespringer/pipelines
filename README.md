@@ -65,8 +65,8 @@ implementation specification.
 
 ## Installation
 
-Requires **Python ≥ 3.11** (uses stdlib `tomllib`). The core has no third-party
-dependencies.
+Requires **Python ≥ 3.10**. The core is pure standard library, except on Python 3.10
+where the `tomli` backport (auto-installed) backfills stdlib `tomllib`.
 
 ```bash
 pip install .                 # from a checkout
