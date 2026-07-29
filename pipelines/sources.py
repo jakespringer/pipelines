@@ -8,8 +8,35 @@ See ``docs/04-sources.md``.
 from __future__ import annotations
 
 import fnmatch
+import os
 import shutil
+import uuid
 from pathlib import Path
+
+
+def _copy_atomic(src: Path, dst: Path) -> None:
+    """Copy ``src`` to ``dst`` atomically; skip when ``dst`` already matches.
+
+    Concurrent consumers can retrieve the same given input into one shared
+    working path. A plain ``copy2`` rewrites the destination in place on every
+    retrieval, so a reader racing a writer sees a torn file (observed as
+    mid-line ``JSONDecodeError``s fanning out to hundreds of blocked jobs).
+    Writing to a temp name and ``os.replace``-ing makes each copy one atomic
+    rename, and the size+mtime match (``copy2`` preserves mtime) makes repeat
+    retrievals no-ops instead of rewrite storms.
+    """
+    try:
+        s, d = src.stat(), dst.stat()
+        if s.st_size == d.st_size and int(s.st_mtime) == int(d.st_mtime):
+            return
+    except FileNotFoundError:
+        pass
+    tmp = dst.with_name(f".{dst.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def local(path, *, into, only: list[str] | None = None) -> None:
@@ -24,10 +51,10 @@ def local(path, *, into, only: list[str] | None = None) -> None:
             if only is not None and not _matches(rel, only):
                 continue
             (into / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(f, into / rel)
+            _copy_atomic(f, into / rel)
     elif src.is_file():
         if only is None or _matches(Path(src.name), only):
-            shutil.copy2(src, into / src.name)
+            _copy_atomic(src, into / src.name)
     else:
         raise FileNotFoundError(f"source.local: no such path {src}")
 

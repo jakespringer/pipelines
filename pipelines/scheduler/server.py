@@ -13,6 +13,7 @@ the scheduler thread — other threads only enqueue. State reads (snapshots) tak
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import queue
@@ -533,5 +534,15 @@ def _bind_server_socket(start: int = 16400, tries: int = 200) -> tuple[socket.so
 
 
 def job_log_path(logdir: Path, relpath: str) -> Path:
-    """Per-job combined-output log path; ``relpath`` is slugged into one filename."""
-    return Path(logdir) / "jobs" / f"{slug(relpath)}.log"
+    """Per-job combined-output log path; ``relpath`` is slugged into one filename.
+
+    Deeply-chained relpaths can slug past the filesystem's 255-byte filename
+    limit (NAME_MAX), and the resulting ``open()`` OSError would kill the whole
+    scheduler — cap the slug and keep a short digest of the full relpath so
+    truncated names stay unique.
+    """
+    name = slug(relpath)
+    if len(name) > 200:
+        digest = hashlib.sha1(relpath.encode()).hexdigest()[:10]
+        name = f"{name[:200].rstrip('_')}-{digest}"
+    return Path(logdir) / "jobs" / f"{name}.log"
