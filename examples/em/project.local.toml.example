@@ -6,17 +6,17 @@
 
 [config]
 # Default durable Store: datasets, prompts, generations, judgements, reports.
-remote_store = "gs://jspringe/projects/em"
+remote_store = "gs://USER/projects/em"
 
 # Materialization path used while a job runs. Keep it on the same mounted
 # filesystem as local_model_store so committing a checkpoint can be a rename.
-base_path = "/data/user_data/jspringe/em-work"
+base_path = "/data/user_data/USER/em-work"
 
 # Large trained checkpoints deliberately stay off GCS. This file:// Store must
 # be visible to downstream generation jobs (shared/persistent filesystem, or
 # paired with a placement policy that keeps consumers on the producing node).
-local_model_store = "file:///data/user_data/jspringe/em-models"
+local_model_store = "file:///data/user_data/USER/em-models"
 
 # Arbitrary project values may be used by experiment wiring or construction.
-data_dir = "/home/jspringe/projects/flexibility/data/em"
+data_dir = "/home/USER/projects/flexibility/data/em"
 # wandb_api_key = "..."

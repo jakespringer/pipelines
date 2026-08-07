@@ -12,4 +12,4 @@ slurm_setup = "source ~/.bashrc && conda activate llm"
 slurm_defaults = { partition = "general" }
 # `slurm run` also needs a shared-filesystem run dir (event log + per-job logs the dashboard
 # reads, reachable from compute nodes). It names a local path, so set it in the system overlay:
-#   slurm_run_dir = "/data/user_data/jspringe/pipelines-runs"
+#   slurm_run_dir = "/data/user_data/USER/pipelines-runs"

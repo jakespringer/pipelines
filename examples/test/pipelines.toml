@@ -14,6 +14,6 @@ preview_prefix = "[test-preview]"
 
 # Replace remote_store with a gs:// URI in the system TOML overlay to exercise
 # the ordinary artifact upload/retrieve path against Google Cloud Storage.
-remote_store = "gs://cmu-gpucloud-jspringe/pipelines-test/store"
+remote_store = "file:///tmp/pipelines-test/store"
 local_index_store = "file:///tmp/pipelines-test/local-index-store"
 base_path = "/tmp/pipelines-test/work"

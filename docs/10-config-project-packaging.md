@@ -70,10 +70,10 @@ built-in defaults
   ```toml
   # ~/.config/pipelines/projects/em.toml
   [config]
-  remote_store      = "gs://jspringe/projects/em"
-  base_path         = "/data/user_data/jspringe/em-work"     # same fs as local_model_store
-  local_model_store = "file:///data/user_data/jspringe/em-models"
-  data_dir          = "/home/jspringe/projects/flexibility/data/em"
+  remote_store      = "gs://USER/projects/em"
+  base_path         = "/data/user_data/USER/em-work"     # same fs as local_model_store
+  local_model_store = "file:///data/user_data/USER/em-models"
+  data_dir          = "/home/USER/projects/flexibility/data/em"
   wandb_api_key     = "..."
   ```
 
