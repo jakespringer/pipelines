@@ -79,7 +79,23 @@ def url(url: str, *, into, only=None, sha256: str | None = None) -> None:
 
 
 def gs(gs_uri: str, *, into, only=None) -> None:
-    raise NotImplementedError("source.gs requires the gs:// backend (not yet implemented)")
+    """Download every object under a ``gs://<bucket>/<prefix>`` directory into ``into``.
+
+    Delegates to :class:`~pipelines.store.gs.GSStore` rooted at the bucket, so it
+    inherits the store's retries, connection pooling, and rsync-style size-match
+    skipping. Works on any object prefix — the directory need not have been
+    published by a pipelines store (no manifest required); store-internal
+    ``.pipelines/`` bookkeeping is never materialized.
+    """
+    from urllib.parse import urlsplit
+
+    from .store.base import Store
+
+    parts = urlsplit(gs_uri)
+    if parts.scheme != "gs" or not parts.netloc or not parts.path.strip("/"):
+        raise ValueError(f"source.gs expects gs://<bucket>/<prefix>; got {gs_uri!r}")
+    Store.from_uri(f"gs://{parts.netloc}").get_dir(
+        parts.path.strip("/"), Path(into), only=only)
 
 
 def _matches(rel: Path, only: list[str]) -> bool:

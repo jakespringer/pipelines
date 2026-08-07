@@ -8,6 +8,7 @@ from pathlib import Path
 from . import file as _file   # noqa: F401  (registers file://)
 from . import gs as _gs       # noqa: F401  (registers gs://)
 from . import link as _link   # noqa: F401  (registers link://, symlink-on-materialize)
+from . import mirror as _mirror  # noqa: F401  (registers mirror://, local-first + replica)
 from .base import ReadOnlyStoreError, Store
 
 __all__ = ["Store", "ReadOnlyStoreError", "publish_atomic", "write_meta"]

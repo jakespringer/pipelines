@@ -73,6 +73,11 @@ def _dispatch(groups: dict[str, list], executor, argv: list[str] | None = None) 
         from .dashboard.server import dashboard_main
         return dashboard_main(rest)
 
+    # `mirror` reconciles a mirror:// store with its replica; project-independent.
+    if verb == "mirror":
+        from .store.mirror import mirror_main
+        return mirror_main(rest)
+
     # Hidden worker verb: build exactly one artifact (used by Parallel/Slurm executor jobs).
     if verb == "_worker":
         _, opts, flags = _parse(rest)
@@ -452,6 +457,12 @@ def main(argv: list[str] | None = None) -> int:
     if rest[:2] == ["slurm", "cat"]:
         from .execution.executors.slurm_cli import cat_main
         return cat_main(rest[2:])
+
+    # `mirror sync|status <uri>` reconciles a mirror:// store with its replica from the URI alone —
+    # project-independent (runs on any node, no run.py needed).
+    if rest and rest[0] == "mirror":
+        from .store.mirror import mirror_main
+        return mirror_main(rest[1:])
 
     run_file = _discover_run_file(project)
     project_dir = run_file.parent
